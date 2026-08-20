@@ -1,13 +1,9 @@
 import Foundation
 import UIKit
-import OpenTelemetryApi
 
-private nonisolated(unsafe) var _exceptionStorage: Storage?
-private nonisolated(unsafe) var _exceptionSessionId: String = ""
+public actor MobileOTelSDK {
 
-public actor MobileSDK {
-
-    public static let shared = MobileSDK()
+    public static let shared = MobileOTelSDK()
 
     public enum Severity: Int, Codable, Sendable {
         case trace, debug, info, warn, error, fatal
@@ -19,10 +15,10 @@ public actor MobileSDK {
         public let environment: String
         public let tenantId: String
         public let applicationId: String
+        public let collectorHost: String
+        public let collectorPort: Int
         public let queueMaxBytes: Int
         public let retentionHours: Int
-        public let maxBatchEvents: Int
-        public let maxBatchBytes: Int
 
         public init(
             serviceName: String,
@@ -30,55 +26,58 @@ public actor MobileSDK {
             environment: String,
             tenantId: String,
             applicationId: String,
+            collectorHost: String,
+            collectorPort: Int = 4317,
             queueMaxBytes: Int = 50 * 1024 * 1024,
-            retentionHours: Int = 72,
-            maxBatchEvents: Int = 200,
-            maxBatchBytes: Int = 512 * 1024
+            retentionHours: Int = 72
         ) {
             self.serviceName = serviceName
             self.serviceVersion = serviceVersion
             self.environment = environment
             self.tenantId = tenantId
             self.applicationId = applicationId
+            self.collectorHost = collectorHost
+            self.collectorPort = collectorPort
             self.queueMaxBytes = queueMaxBytes
             self.retentionHours = retentionHours
-            self.maxBatchEvents = maxBatchEvents
-            self.maxBatchBytes = maxBatchBytes
         }
     }
 
     private var config: Config?
-    private var storage: Storage?
+    private var storage: EncryptedStore?
     private var bridge: OTelBridge?
-    private var running = false
     private var sessionId = UUID().uuidString
-    private var breadcrumbs: [String] = []
-    private var enabled = true
-    private var minSeverity: Severity = .info
-    private var sampleRate = 1.0
-    private var failureCount = 0
+    private var breadcrumbs: [Breadcrumb] = []
+    private var policy = Policy()
+    private var running = false
+    private var backoff = RetryBackoff()
+
+    // C function pointers cannot capture context — use globals for crash handler.
+    nonisolated(unsafe) private static var _crashStorage: EncryptedStore?
+    nonisolated(unsafe) private static var _crashSessionId: String = ""
 
     private init() {}
 
-    /// The host app supplies its already-configured OpenTelemetry LoggerProvider.
-    public func initialize(
-        config: Config,
-        loggerProvider: LoggerProvider
-    ) async throws {
+    public func initialize(config: Config) async throws {
         guard !running else { return }
 
-        let storage = try Storage(
+        let storage = try EncryptedStore(
             maxBytes: config.queueMaxBytes,
             retentionHours: config.retentionHours
         )
 
+        let bridge = try OTelBridge(config: config)
+
         self.config = config
         self.storage = storage
-        self.bridge = OTelBridge(loggerProvider: loggerProvider)
+        self.bridge = bridge
         self.running = true
 
-        try? await storage.importPendingCrashes(sessionId: sessionId)
+        try await storage.importCrashRecords(sessionId: sessionId)
+        try await storage.importSignalCrashRecords(sessionId: sessionId)
+
         installExceptionHandler()
+        SignalCrashHandler.install(crashDir: storage.crashDir, sessionId: sessionId)
 
         Task { [weak self] in
             while let self, await self.running {
@@ -87,8 +86,8 @@ public actor MobileSDK {
                     await self.resetBackoff()
                     try? await Task.sleep(nanoseconds: 5_000_000_000)
                 } else {
-                    let delay = await self.nextBackoff()
-                    try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
+                    let ms = await self.nextBackoff()
+                    try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
                 }
             }
         }
@@ -99,9 +98,9 @@ public actor MobileSDK {
                 "service.name": config.serviceName,
                 "service.version": config.serviceVersion,
                 "deployment.environment.name": config.environment,
-                "telemetry.tenant.id": config.tenantId,
-                "telemetry.application.id": config.applicationId,
-                "device.model.identifier": UIDevice.current.model,
+                "tenant.id": config.tenantId,
+                "application.id": config.applicationId,
+                "device.model": UIDevice.current.model,
                 "os.name": "iOS",
                 "os.version": UIDevice.current.systemVersion
             ]
@@ -113,14 +112,15 @@ public actor MobileSDK {
     }
 
     public func breadcrumb(category: String, message: String) {
-        breadcrumbs.append("\(category):\(message)")
+        breadcrumbs.append(Breadcrumb(category: category, message: message))
         if breadcrumbs.count > 50 {
             breadcrumbs.removeFirst(breadcrumbs.count - 50)
         }
     }
 
-    public func newSession() { sessionId = UUID().uuidString }
-    public func shutdown() { running = false }
+    public func newSession() {
+        sessionId = UUID().uuidString
+    }
 
     public func debug(_ message: String, attributes: [String: String] = [:]) async {
         await emit(.debug, message, attributes)
@@ -142,57 +142,69 @@ public actor MobileSDK {
         await emit(.fatal, message, attributes)
     }
 
-    private func emit(
-        _ severity: Severity,
-        _ message: String,
-        _ attributes: [String: String]
-    ) async {
-        guard running,
-              enabled,
-              severity.rawValue >= minSeverity.rawValue,
-              let config,
-              let storage
-        else { return }
+    public func shutdown() async {
+        running = false
+        SignalCrashHandler.uninstall()
+        await bridge?.shutdown()
+        bridge = nil
+    }
+
+    private func emit(_ severity: Severity, _ message: String, _ attributes: [String: String]) async {
+        guard running, let config, let storage else { return }
+
+        if !policy.enabled { return }
+        if severity.rawValue < policy.minSeverity.rawValue { return }
 
         if severity.rawValue < Severity.error.rawValue &&
-           Double.random(in: 0...1) > sampleRate { return }
+           Double.random(in: 0...1) > policy.sampleRate {
+            return
+        }
 
         var attrs = Security.redact(attributes)
+
         attrs["service.name"] = config.serviceName
         attrs["service.version"] = config.serviceVersion
         attrs["deployment.environment.name"] = config.environment
-        attrs["telemetry.tenant.id"] = config.tenantId
-        attrs["telemetry.application.id"] = config.applicationId
+        attrs["tenant.id"] = config.tenantId
+        attrs["application.id"] = config.applicationId
 
         if severity.rawValue >= Severity.error.rawValue {
-            attrs["telemetry.breadcrumbs"] = breadcrumbs.joined(separator: " | ")
+            attrs["session.breadcrumbs"] = breadcrumbs
+                .map { "\($0.category):\($0.message)" }
+                .joined(separator: " | ")
         }
 
-        try? await storage.enqueue(
-            Event(
-                eventId: UUID().uuidString,
-                timestampUnixMs: Int64(Date().timeIntervalSince1970 * 1000),
-                severity: severity,
-                type: "log",
-                message: message,
-                sessionId: sessionId,
-                attributes: attrs
-            )
+        let event = Event(
+            eventId: UUID().uuidString,
+            timestampUnixMs: Int64(Date().timeIntervalSince1970 * 1000),
+            severity: severity,
+            type: "log",
+            message: message,
+            sessionId: sessionId,
+            attributes: attrs
         )
+
+        try? await storage.enqueue(event)
     }
 
     private func flushPersisted() async -> Bool {
-        guard let config, let storage, let bridge else { return true }
+        guard let storage, let bridge else { return true }
+
         do {
             let rows = try await storage.batch(
-                maxEvents: config.maxBatchEvents,
-                maxBytes: config.maxBatchBytes
+                maxEvents: policy.maxBatchEvents,
+                maxBytes: policy.maxBatchBytes
             )
-            for (url, data) in rows {
-                let event = try JSONDecoder().decode(Event.self, from: data)
-                guard await bridge.emit(event) else { return false }
-                await storage.acknowledge([url])
+
+            if rows.isEmpty { return true }
+
+            for (file, clear) in rows {
+                let event = try JSONDecoder().decode(Event.self, from: clear)
+                let ok = await bridge.emit(event)
+                if !ok { return false }
+                await storage.acknowledge([file])
             }
+
             return true
         } catch {
             return false
@@ -201,20 +213,19 @@ public actor MobileSDK {
 
     private func installExceptionHandler() {
         guard let storage else { return }
-        _exceptionStorage = storage
-        _exceptionSessionId = sessionId
+        MobileOTelSDK._crashStorage = storage
+        MobileOTelSDK._crashSessionId = sessionId
+
         NSSetUncaughtExceptionHandler { exception in
-            _exceptionStorage?.persistException(exception, sessionId: _exceptionSessionId)
+            MobileOTelSDK._crashStorage?.persistException(exception, sessionId: MobileOTelSDK._crashSessionId)
+            // Tell the signal handler that this crash is already captured, so SIGABRT
+            // (which the runtime raises immediately after) does not write a second record.
+            SignalCrashHandler.exceptionAlreadyCaptured = true
         }
     }
 
-    private func resetBackoff() { failureCount = 0 }
-
-    private func nextBackoff() -> Int {
-        failureCount += 1
-        let exp = min(failureCount, 8)
-        return min(300_000, 1_000 * (1 << exp)) + Int.random(in: 0...1_000)
-    }
+    private func resetBackoff() { backoff.reset() }
+    private func nextBackoff() -> Int { backoff.nextDelayMs() }
 
     struct Event: Codable, Sendable {
         let eventId: String
@@ -224,5 +235,18 @@ public actor MobileSDK {
         let message: String
         let sessionId: String
         let attributes: [String: String]
+    }
+
+    struct Policy: Sendable {
+        var enabled = true
+        var minSeverity: Severity = .debug
+        var sampleRate = 1.0
+        var maxBatchEvents = 200
+        var maxBatchBytes = 512 * 1024
+    }
+
+    struct Breadcrumb: Sendable {
+        let category: String
+        let message: String
     }
 }
