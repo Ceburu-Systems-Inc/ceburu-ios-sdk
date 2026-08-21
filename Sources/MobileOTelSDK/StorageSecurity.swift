@@ -62,6 +62,7 @@ actor EncryptedStore {
     private let key: SymmetricKey
     private let maxBytes: Int
     private let maxAgeSeconds: TimeInterval
+    private var lastPruneTime: Date = .distantPast
 
     init(maxBytes: Int, retentionHours: Int) throws {
         let base = FileManager.default.urls(
@@ -187,7 +188,10 @@ actor EncryptedStore {
     }
 
     private func pruneOld() {
-        let cutoff = Date().addingTimeInterval(-maxAgeSeconds)
+        let now = Date()
+        guard now.timeIntervalSince(lastPruneTime) >= 60 else { return }
+        lastPruneTime = now
+        let cutoff = now.addingTimeInterval(-maxAgeSeconds)
         for url in queueFiles() {
             if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
                let date = attrs[.creationDate] as? Date,

@@ -81,11 +81,14 @@ public actor MobileOTelSDK {
 
         Task { [weak self] in
             while let self, await self.running {
-                let ok = await self.flushPersisted()
-                if ok {
+                switch await self.flushPersisted() {
+                case .flushed:
                     await self.resetBackoff()
                     try? await Task.sleep(nanoseconds: 5_000_000_000)
-                } else {
+                case .empty:
+                    await self.resetBackoff()
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                case .failed:
                     let ms = await self.nextBackoff()
                     try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
                 }
@@ -187,8 +190,10 @@ public actor MobileOTelSDK {
         try? await storage.enqueue(event)
     }
 
-    private func flushPersisted() async -> Bool {
-        guard let storage, let bridge else { return true }
+    private enum FlushResult { case flushed, empty, failed }
+
+    private func flushPersisted() async -> FlushResult {
+        guard let storage, let bridge else { return .empty }
 
         do {
             let rows = try await storage.batch(
@@ -196,18 +201,18 @@ public actor MobileOTelSDK {
                 maxBytes: policy.maxBatchBytes
             )
 
-            if rows.isEmpty { return true }
+            if rows.isEmpty { return .empty }
 
             for (file, clear) in rows {
                 let event = try JSONDecoder().decode(Event.self, from: clear)
                 let ok = await bridge.emit(event)
-                if !ok { return false }
+                if !ok { return .failed }
                 await storage.acknowledge([file])
             }
 
-            return true
+            return .flushed
         } catch {
-            return false
+            return .failed
         }
     }
 
