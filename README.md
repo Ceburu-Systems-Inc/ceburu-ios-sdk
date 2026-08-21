@@ -38,7 +38,7 @@ struct MyApp: App {
             try? await MobileOTelSDK.shared.initialize(
                 config: MobileOTelSDK.Config(
                     serviceName:    "MyApp",
-                    serviceVersion: "1.0.0",
+                    serviceVersion: "1.0.1",
                     environment:    "production",
                     tenantId:       "<your-tenant-id>",        // provided by account team
                     applicationId:  "<your-application-id>",   // provided by account team
