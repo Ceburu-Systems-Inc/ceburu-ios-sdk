@@ -127,13 +127,19 @@ actor EncryptedStore {
         files.forEach { try? FileManager.default.removeItem(at: $0) }
     }
 
+    nonisolated func persistBreadcrumbs(_ text: String) {
+        let file = crashDir.appendingPathComponent("breadcrumbs.txt")
+        try? text.data(using: .utf8)?.write(to: file, options: [.atomic])
+    }
+
     nonisolated func persistException(_ exception: NSException, sessionId: String) {
         let object: [String: Any] = [
             "timestamp_ms": Int64(Date().timeIntervalSince1970 * 1000),
             "session_id": sessionId,
             "exception_type": exception.name.rawValue,
             "exception_message": exception.reason ?? "",
-            "exception_stacktrace": exception.callStackSymbols.joined(separator: "\n")
+            "exception_stacktrace": exception.callStackSymbols.joined(separator: "\n"),
+            "breadcrumbs": MobileOTelSDK._crashBreadcrumbs
         ]
 
         if let data = try? JSONSerialization.data(withJSONObject: object) {
@@ -155,6 +161,15 @@ actor EncryptedStore {
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 else { continue }
 
+                let crashSessionId = json["session_id"] as? String ?? sessionId
+                let breadcrumbs = json["breadcrumbs"] as? String ?? ""
+                var attributes: [String: String] = [
+                    "exception.type":       String(describing: json["exception_type"] ?? ""),
+                    "exception.message":    String(describing: json["exception_message"] ?? ""),
+                    "exception.stacktrace": String(describing: json["exception_stacktrace"] ?? ""),
+                    "crash.session.id":     crashSessionId
+                ]
+                if !breadcrumbs.isEmpty { attributes["session.breadcrumbs"] = breadcrumbs }
                 let event = MobileOTelSDK.Event(
                     eventId: UUID().uuidString,
                     timestampUnixMs: json["timestamp_ms"] as? Int64
@@ -163,11 +178,7 @@ actor EncryptedStore {
                     type: "crash",
                     message: "Unhandled iOS exception",
                     sessionId: sessionId,
-                    attributes: [
-                        "exception.type": String(describing: json["exception_type"] ?? ""),
-                        "exception.message": String(describing: json["exception_message"] ?? ""),
-                        "exception.stacktrace": String(describing: json["exception_stacktrace"] ?? "")
-                    ]
+                    attributes: attributes
                 )
 
                 try enqueue(event)
@@ -235,20 +246,42 @@ actor EncryptedStore {
     // MARK: - Signal crash import (next-launch delivery)
 
     func importSignalCrashRecords(sessionId: String) async throws {
+        let breadcrumbsFile = crashDir.appendingPathComponent("breadcrumbs.txt")
+        let savedBreadcrumbs = (try? String(contentsOf: breadcrumbsFile, encoding: .utf8)) ?? ""
+
         let files = (try? FileManager.default.contentsOfDirectory(
             at: crashDir, includingPropertiesForKeys: nil
         )) ?? []
 
+        var importedAny = false
         for file in files where file.pathExtension == "sigseg" {
             do {
                 let data = try Data(contentsOf: file)
-                guard let event = parseSignalCrash(data: data, fallbackSessionId: sessionId)
+                guard var event = parseSignalCrash(data: data, fallbackSessionId: sessionId)
                 else { try? FileManager.default.removeItem(at: file); continue }
+                if !savedBreadcrumbs.isEmpty {
+                    var attrs = event.attributes
+                    attrs["session.breadcrumbs"] = savedBreadcrumbs
+                    event = MobileOTelSDK.Event(
+                        eventId: event.eventId,
+                        timestampUnixMs: event.timestampUnixMs,
+                        severity: event.severity,
+                        type: event.type,
+                        message: event.message,
+                        sessionId: event.sessionId,
+                        attributes: attrs
+                    )
+                }
                 try enqueue(event)
                 try? FileManager.default.removeItem(at: file)
+                importedAny = true
             } catch {
                 // Keep for a later launch
             }
+        }
+
+        if importedAny {
+            try? FileManager.default.removeItem(at: breadcrumbsFile)
         }
     }
 

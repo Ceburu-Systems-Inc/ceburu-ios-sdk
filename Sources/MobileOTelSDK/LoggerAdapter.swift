@@ -5,6 +5,7 @@ import os
 
 public protocol LoggerAdapter: Sendable {
     func install() async
+    func uninstall() async
 }
 
 // MARK: - MobileLogSink
@@ -49,20 +50,10 @@ public enum MobileLogSink {
             await MobileOTelSDK.shared.warn(message, attributes: attributes)
 
         case "ERROR":
-            var attrs = attributes
-            if let error {
-                attrs["exception.type"] = String(describing: type(of: error))
-                attrs["exception.message"] = error.localizedDescription
-            }
-            await MobileOTelSDK.shared.error(message, attributes: attrs)
+            await MobileOTelSDK.shared.error(message, error: error, attributes: attributes)
 
         case "FATAL", "CRITICAL":
-            var attrs = attributes
-            if let error {
-                attrs["exception.type"] = String(describing: type(of: error))
-                attrs["exception.message"] = error.localizedDescription
-            }
-            await MobileOTelSDK.shared.fatal(message, attributes: attrs)
+            await MobileOTelSDK.shared.fatal(message, error: error, attributes: attributes)
 
         default:
             await MobileOTelSDK.shared.info(message, attributes: attributes)
@@ -80,6 +71,7 @@ public final class CallbackLoggerAdapter: LoggerAdapter, @unchecked Sendable {
     public init() {}
 
     public func install() async {}
+    public func uninstall() async {}
 
     /// Call this from your existing logger. Safe to call from synchronous contexts.
     public func forward(
@@ -106,6 +98,7 @@ public final class OSLogAdapter: LoggerAdapter, @unchecked Sendable {
     }
 
     public func install() async {}
+    public func uninstall() async {}
 
     public func debug(_ message: String, attributes: [String: String] = [:]) {
         osLogger.debug("\(message, privacy: .public)")

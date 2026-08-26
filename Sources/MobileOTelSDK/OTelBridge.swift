@@ -42,6 +42,7 @@ actor OTelBridge {
         self.processor = processor
         self.logger = OpenTelemetry.instance.loggerProvider
             .loggerBuilder(instrumentationScopeName: "enterprise.mobile.sdk")
+            .setInstrumentationVersion("1.0.2")
             .build()
         self.group = group
         self.connection = connection

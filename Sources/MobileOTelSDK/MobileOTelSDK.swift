@@ -19,6 +19,8 @@ public actor MobileOTelSDK {
         public let collectorPort: Int
         public let queueMaxBytes: Int
         public let retentionHours: Int
+        public let maxBatchEvents: Int
+        public let maxBatchBytes: Int
 
         public init(
             serviceName: String,
@@ -29,7 +31,9 @@ public actor MobileOTelSDK {
             collectorHost: String,
             collectorPort: Int = 4317,
             queueMaxBytes: Int = 50 * 1024 * 1024,
-            retentionHours: Int = 72
+            retentionHours: Int = 72,
+            maxBatchEvents: Int = 200,
+            maxBatchBytes: Int = 512 * 1024
         ) {
             self.serviceName = serviceName
             self.serviceVersion = serviceVersion
@@ -40,6 +44,8 @@ public actor MobileOTelSDK {
             self.collectorPort = collectorPort
             self.queueMaxBytes = queueMaxBytes
             self.retentionHours = retentionHours
+            self.maxBatchEvents = maxBatchEvents
+            self.maxBatchBytes = maxBatchBytes
         }
     }
 
@@ -51,10 +57,12 @@ public actor MobileOTelSDK {
     private var policy = Policy()
     private var running = false
     private var backoff = RetryBackoff()
+    private var adapters: [LoggerAdapter] = []
 
     // C function pointers cannot capture context — use globals for crash handler.
     nonisolated(unsafe) private static var _crashStorage: EncryptedStore?
     nonisolated(unsafe) private static var _crashSessionId: String = ""
+    nonisolated(unsafe) static var _crashBreadcrumbs: String = ""
 
     private init() {}
 
@@ -71,6 +79,8 @@ public actor MobileOTelSDK {
         self.config = config
         self.storage = storage
         self.bridge = bridge
+        self.policy.maxBatchEvents = config.maxBatchEvents
+        self.policy.maxBatchBytes = config.maxBatchBytes
         self.running = true
 
         try await storage.importCrashRecords(sessionId: sessionId)
@@ -103,6 +113,7 @@ public actor MobileOTelSDK {
                 "deployment.environment.name": config.environment,
                 "tenant.id": config.tenantId,
                 "application.id": config.applicationId,
+                "device.manufacturer": "Apple",
                 "device.model": UIDevice.current.model,
                 "os.name": "iOS",
                 "os.version": UIDevice.current.systemVersion
@@ -112,6 +123,7 @@ public actor MobileOTelSDK {
 
     public func installLoggerAdapter(_ adapter: LoggerAdapter) async {
         await adapter.install()
+        adapters.append(adapter)
     }
 
     public func breadcrumb(category: String, message: String) {
@@ -119,10 +131,17 @@ public actor MobileOTelSDK {
         if breadcrumbs.count > 50 {
             breadcrumbs.removeFirst(breadcrumbs.count - 50)
         }
+        let serialized = breadcrumbs
+            .map { "\($0.category):\($0.message)" }
+            .joined(separator: " | ")
+        MobileOTelSDK._crashBreadcrumbs = serialized
+        storage?.persistBreadcrumbs(serialized)
     }
 
-    public func newSession() {
+    @discardableResult
+    public func newSession() -> String {
         sessionId = UUID().uuidString
+        return sessionId
     }
 
     public func debug(_ message: String, attributes: [String: String] = [:]) async {
@@ -137,15 +156,17 @@ public actor MobileOTelSDK {
         await emit(.warn, message, attributes)
     }
 
-    public func error(_ message: String, attributes: [String: String] = [:]) async {
-        await emit(.error, message, attributes)
+    public func error(_ message: String, error: Error? = nil, attributes: [String: String] = [:]) async {
+        await emit(.error, message, mergeError(attributes, error))
     }
 
-    public func fatal(_ message: String, attributes: [String: String] = [:]) async {
-        await emit(.fatal, message, attributes)
+    public func fatal(_ message: String, error: Error? = nil, attributes: [String: String] = [:]) async {
+        await emit(.fatal, message, mergeError(attributes, error))
     }
 
     public func shutdown() async {
+        for adapter in adapters { await adapter.uninstall() }
+        adapters.removeAll()
         running = false
         SignalCrashHandler.uninstall()
         await bridge?.shutdown()
@@ -171,7 +192,7 @@ public actor MobileOTelSDK {
         attrs["tenant.id"] = config.tenantId
         attrs["application.id"] = config.applicationId
 
-        if severity.rawValue >= Severity.error.rawValue {
+        if severity.rawValue >= Severity.error.rawValue && !breadcrumbs.isEmpty {
             attrs["session.breadcrumbs"] = breadcrumbs
                 .map { "\($0.category):\($0.message)" }
                 .joined(separator: " | ")
@@ -229,6 +250,14 @@ public actor MobileOTelSDK {
         }
     }
 
+    private func mergeError(_ attrs: [String: String], _ error: Error?) -> [String: String] {
+        guard let error else { return attrs }
+        var out = attrs
+        out["exception.type"]    = String(describing: type(of: error))
+        out["exception.message"] = error.localizedDescription
+        return out
+    }
+
     private func resetBackoff() { backoff.reset() }
     private func nextBackoff() -> Int { backoff.nextDelayMs() }
 
@@ -244,7 +273,7 @@ public actor MobileOTelSDK {
 
     struct Policy: Sendable {
         var enabled = true
-        var minSeverity: Severity = .debug
+        var minSeverity: Severity = .info
         var sampleRate = 1.0
         var maxBatchEvents = 200
         var maxBatchBytes = 512 * 1024
