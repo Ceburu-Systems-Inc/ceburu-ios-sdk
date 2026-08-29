@@ -5,8 +5,22 @@ import Darwin
 
 // MARK: - PII Redaction
 
+/// Attribute sanitizer — redacts or hashes PII before events are written to disk or exported.
+///
+/// Redaction rules applied in order (key matching is case-insensitive):
+///
+/// | Key contains | Action |
+/// |---|---|
+/// | `password`, `authorization`, `cookie`, `secret` | Dropped entirely — not written |
+/// | `token`, `card` | Value replaced with `[REDACTED]` |
+/// | `email`, `phone` | Value replaced with its SHA-256 hex digest |
+/// | anything else | Passed through unchanged |
 enum Security {
 
+    /// Returns a copy of `input` with PII values redacted or hashed.
+    ///
+    /// - Parameter input: Raw attribute dictionary from the caller.
+    /// - Returns: Sanitized dictionary safe to write to disk and export to the collector.
     static func redact(_ input: [String: String]) -> [String: String] {
         var out: [String: String] = [:]
 
@@ -40,11 +54,20 @@ enum Security {
 
 // MARK: - Retry Backoff
 
+/// Exponential backoff with jitter for flush-loop retries.
+///
+/// On each `nextDelayMs()` call the delay doubles (capped at 5 minutes), with ±1 s of
+/// random jitter to prevent thundering-herd reconnections when multiple instances restart
+/// simultaneously. Call `reset()` after a successful flush to start from the minimum delay.
 struct RetryBackoff {
     private(set) var attempt = 0
 
+    /// Resets the backoff counter. Call after a successful export.
     mutating func reset() { attempt = 0 }
 
+    /// Returns the next delay in milliseconds and advances the attempt counter.
+    ///
+    /// Delay schedule: 2 s, 4 s, 8 s, … up to 5 min (300 s), plus 0–1 s of jitter.
     mutating func nextDelayMs() -> Int {
         attempt += 1
         let exp = min(attempt, 8)
@@ -55,6 +78,21 @@ struct RetryBackoff {
 
 // MARK: - Encrypted Queue
 
+/// AES-256-GCM encrypted on-device event queue backed by the filesystem.
+///
+/// Each event is individually encrypted and written as a `.bin` file named
+/// `<timestampMs>_<eventId>.bin`. Files are ordered by name (timestamp) on read,
+/// so the queue is naturally FIFO. Crash records are stored as `.json` files in a
+/// separate `Ceburu/Crashes` directory.
+///
+/// **Encryption**: AES-GCM with a 256-bit key generated once per install and stored
+/// in the iOS Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.
+///
+/// **Quota enforcement**: When the total queue size exceeds `maxBytes`, lowest-severity
+/// events are evicted first to preserve recent errors and fatals.
+///
+/// **Retention**: Events older than `retentionHours` are pruned at most once per minute
+/// during normal operation.
 actor EncryptedStore {
 
     private let queueDir: URL
@@ -64,13 +102,20 @@ actor EncryptedStore {
     private let maxAgeSeconds: TimeInterval
     private var lastPruneTime: Date = .distantPast
 
+    /// Creates the encrypted store, initialising the queue and crash directories
+    /// and loading (or generating) the AES key from the Keychain.
+    ///
+    /// - Parameters:
+    ///   - maxBytes:       Maximum total size of the on-device queue in bytes.
+    ///   - retentionHours: Events older than this are pruned during the next flush cycle.
+    /// - Throws: If the directories cannot be created or the Keychain operation fails.
     init(maxBytes: Int, retentionHours: Int) throws {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         )[0]
 
-        queueDir = base.appendingPathComponent("MobileOTel/Queue", isDirectory: true)
-        crashDir = base.appendingPathComponent("MobileOTel/Crashes", isDirectory: true)
+        queueDir = base.appendingPathComponent("Ceburu/Queue", isDirectory: true)
+        crashDir = base.appendingPathComponent("Ceburu/Crashes", isDirectory: true)
 
         try FileManager.default.createDirectory(at: queueDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: crashDir, withIntermediateDirectories: true)
@@ -80,7 +125,15 @@ actor EncryptedStore {
         self.maxAgeSeconds = TimeInterval(retentionHours * 3600)
     }
 
-    func enqueue(_ event: MobileOTelSDK.Event) throws {
+    /// Encrypts and enqueues a single event.
+    ///
+    /// The event is serialized to JSON, encrypted with AES-256-GCM, and written
+    /// atomically (via a `.tmp` file rename) to avoid partial writes. After writing,
+    /// the queue size quota is enforced by evicting low-severity events if needed.
+    ///
+    /// - Parameter event: The event to persist.
+    /// - Throws: If JSON encoding, AES encryption, or the filesystem write fails.
+    func enqueue(_ event: CeburuAnalyticsSDK.Event) throws {
         pruneOld()
 
         let clear = try JSONEncoder().encode(event)
@@ -101,6 +154,18 @@ actor EncryptedStore {
         enforceQuota()
     }
 
+    /// Reads and decrypts a batch of events up to the given limits.
+    ///
+    /// Events are returned in timestamp order (oldest first). Reading stops when
+    /// either `maxEvents` files have been read or adding the next file would exceed
+    /// `maxBytes` (unless the batch is still empty, in which case one oversized
+    /// event is always returned to prevent starvation).
+    ///
+    /// - Parameters:
+    ///   - maxEvents: Maximum number of events in the returned batch.
+    ///   - maxBytes:  Maximum total cleartext size of the returned batch.
+    /// - Returns: Array of `(fileURL, cleartext Data)` pairs ready for export.
+    /// - Throws: If a file cannot be read or decrypted (corrupted files are skipped).
     func batch(maxEvents: Int, maxBytes: Int) throws -> [(URL, Data)] {
         pruneOld()
 
@@ -123,15 +188,37 @@ actor EncryptedStore {
         return result
     }
 
+    /// Deletes successfully exported event files from the queue directory.
+    ///
+    /// Call this after each event in a batch is confirmed delivered to the collector.
+    /// Errors are silently swallowed — a failed delete just means the event is retried
+    /// on the next flush cycle (idempotent delivery).
+    ///
+    /// - Parameter files: File URLs previously returned by ``batch(maxEvents:maxBytes:)``.
     func acknowledge(_ files: [URL]) {
         files.forEach { try? FileManager.default.removeItem(at: $0) }
     }
 
+    /// Persists the current breadcrumb trail to disk so it survives a crash.
+    ///
+    /// `nonisolated` so it can be called synchronously from the signal-handler trampoline
+    /// and from `NSSetUncaughtExceptionHandler` without awaiting the actor.
+    ///
+    /// - Parameter text: Serialized breadcrumb string (pipe-separated `"category:message"` pairs).
     nonisolated func persistBreadcrumbs(_ text: String) {
         let file = crashDir.appendingPathComponent("breadcrumbs.txt")
         try? text.data(using: .utf8)?.write(to: file, options: [.atomic])
     }
 
+    /// Persists an `NSException` to disk for next-launch delivery.
+    ///
+    /// Called from `NSSetUncaughtExceptionHandler` — a synchronous C callback that fires
+    /// on the crashing thread. Uses only Foundation JSON serialization (no async).
+    /// `nonisolated` to avoid actor-isolation overhead at crash time.
+    ///
+    /// - Parameters:
+    ///   - exception: The uncaught Objective-C exception.
+    ///   - sessionId: The session ID active at crash time, read from the `nonisolated(unsafe)` static.
     nonisolated func persistException(_ exception: NSException, sessionId: String) {
         let object: [String: Any] = [
             "timestamp_ms": Int64(Date().timeIntervalSince1970 * 1000),
@@ -139,7 +226,7 @@ actor EncryptedStore {
             "exception_type": exception.name.rawValue,
             "exception_message": exception.reason ?? "",
             "exception_stacktrace": exception.callStackSymbols.joined(separator: "\n"),
-            "breadcrumbs": MobileOTelSDK._crashBreadcrumbs
+            "breadcrumbs": CeburuAnalyticsSDK._crashBreadcrumbs
         ]
 
         if let data = try? JSONSerialization.data(withJSONObject: object) {
@@ -150,6 +237,14 @@ actor EncryptedStore {
         }
     }
 
+    /// Imports crash records persisted by `NSSetUncaughtExceptionHandler` during a previous session.
+    ///
+    /// Called once in ``CeburuAnalyticsSDK/initialize(config:)`` before the flush loop starts.
+    /// Each `.json` file is decoded, converted to a `fatal`-severity `Event`, enqueued for
+    /// delivery, and then deleted. Files that cannot be parsed are silently skipped and left
+    /// for the next launch.
+    ///
+    /// - Parameter sessionId: The current session ID — used as the delivery session for imported crashes.
     func importCrashRecords(sessionId: String) async throws {
         let files = (try? FileManager.default.contentsOfDirectory(
             at: crashDir, includingPropertiesForKeys: nil
@@ -170,7 +265,7 @@ actor EncryptedStore {
                     "crash.session.id":     crashSessionId
                 ]
                 if !breadcrumbs.isEmpty { attributes["session.breadcrumbs"] = breadcrumbs }
-                let event = MobileOTelSDK.Event(
+                let event = CeburuAnalyticsSDK.Event(
                     eventId: UUID().uuidString,
                     timestampUnixMs: json["timestamp_ms"] as? Int64
                         ?? Int64(Date().timeIntervalSince1970 * 1000),
@@ -204,9 +299,12 @@ actor EncryptedStore {
         lastPruneTime = now
         let cutoff = now.addingTimeInterval(-maxAgeSeconds)
         for url in queueFiles() {
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-               let date = attrs[.creationDate] as? Date,
-               date < cutoff {
+            // Parse event timestamp from filename ("{timestampMs}_{eventId}.bin") rather
+            // than using the file's creation date, which can be wrong on restored devices.
+            let stem = url.deletingPathExtension().lastPathComponent
+            let tsMs = Int64(stem.split(separator: "_").first ?? "") ?? 0
+            let eventDate = Date(timeIntervalSince1970: Double(tsMs) / 1000)
+            if eventDate < cutoff {
                 try? FileManager.default.removeItem(at: url)
             }
         }
@@ -236,15 +334,23 @@ actor EncryptedStore {
             let encrypted = try Data(contentsOf: url)
             let sealed = try AES.GCM.SealedBox(combined: encrypted)
             let clear = try AES.GCM.open(sealed, using: key)
-            let event = try JSONDecoder().decode(MobileOTelSDK.Event.self, from: clear)
+            let event = try JSONDecoder().decode(CeburuAnalyticsSDK.Event.self, from: clear)
             return event.severity.rawValue
         } catch {
-            return MobileOTelSDK.Severity.info.rawValue
+            return CeburuAnalyticsSDK.Severity.info.rawValue
         }
     }
 
     // MARK: - Signal crash import (next-launch delivery)
 
+    /// Imports crash records written by ``SignalCrashHandler`` during a previous session.
+    ///
+    /// Called once in ``CeburuAnalyticsSDK/initialize(config:)`` alongside ``importCrashRecords(sessionId:)``.
+    /// Each `.sigseg` binary file is parsed, symbolicated via `dladdr`, and converted to a
+    /// `fatal`-severity `Event`. Any breadcrumbs saved before the crash are re-attached.
+    /// Files that cannot be parsed are deleted immediately to avoid repeated failed imports.
+    ///
+    /// - Parameter sessionId: The current session ID — used as the delivery session for imported crashes.
     func importSignalCrashRecords(sessionId: String) async throws {
         let breadcrumbsFile = crashDir.appendingPathComponent("breadcrumbs.txt")
         let savedBreadcrumbs = (try? String(contentsOf: breadcrumbsFile, encoding: .utf8)) ?? ""
@@ -262,7 +368,7 @@ actor EncryptedStore {
                 if !savedBreadcrumbs.isEmpty {
                     var attrs = event.attributes
                     attrs["session.breadcrumbs"] = savedBreadcrumbs
-                    event = MobileOTelSDK.Event(
+                    event = CeburuAnalyticsSDK.Event(
                         eventId: event.eventId,
                         timestampUnixMs: event.timestampUnixMs,
                         severity: event.severity,
@@ -285,7 +391,26 @@ actor EncryptedStore {
         }
     }
 
-    private func parseSignalCrash(data: Data, fallbackSessionId: String) -> MobileOTelSDK.Event? {
+    /// Parses the binary `.sigseg` crash file written by ``SignalCrashHandler``.
+    ///
+    /// File format (all values little-endian):
+    /// ```
+    /// magic       UInt32   0x4D534947 ("MSIG")
+    /// signal      Int32
+    /// timestampMs Int64
+    /// sessionLen  UInt16   (includes null terminator)
+    /// sessionId   [CChar]  (sessionLen bytes, null-terminated)
+    /// frameCount  UInt16
+    /// frames      [UInt64] (frameCount raw PC addresses)
+    /// ```
+    ///
+    /// Frame addresses are symbolicated using `dladdr` — safe to call in this normal (non-signal) context.
+    ///
+    /// - Parameters:
+    ///   - data:              Raw file contents.
+    ///   - fallbackSessionId: Used when the file's session field is empty or unreadable.
+    /// - Returns: A `fatal`-severity `Event`, or `nil` if the file is corrupt or truncated.
+    private func parseSignalCrash(data: Data, fallbackSessionId: String) -> CeburuAnalyticsSDK.Event? {
         var offset = 0
 
         func read<T: FixedWidthInteger>(_: T.Type) -> T? {
@@ -325,7 +450,7 @@ actor EncryptedStore {
             }
         }
 
-        return MobileOTelSDK.Event(
+        return CeburuAnalyticsSDK.Event(
             eventId: UUID().uuidString,
             timestampUnixMs: tsMs,
             severity: .fatal,
@@ -365,11 +490,21 @@ actor EncryptedStore {
 
 // MARK: - Keychain Key Storage
 
+/// Manages the AES-256 queue encryption key in the iOS Keychain.
+///
+/// The key is generated once on first launch using `SecRandomCopyBytes` and stored
+/// with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` — it is device-bound and
+/// cannot be extracted via iCloud backup or device-to-device transfer.
+/// On subsequent launches, the key is loaded from the Keychain.
 enum KeyStore {
 
-    private static let service = "com.enterprise.mobileotel"
+    private static let service = "com.ceburu.analytics"
     private static let account = "queue-key"
 
+    /// Loads the existing AES key from the Keychain, or generates and stores a new one.
+    ///
+    /// - Returns: The 256-bit `SymmetricKey` for AES-GCM encryption/decryption.
+    /// - Throws: `NSError(domain: "Ceburu.Keychain", ...)` if the Keychain operation fails.
     static func loadOrCreate() throws -> SymmetricKey {
         if let existing = try load() {
             return SymmetricKey(data: existing)
@@ -380,13 +515,16 @@ enum KeyStore {
             SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!)
         }
         guard status == errSecSuccess else {
-            throw NSError(domain: "MobileOTel.Keychain", code: Int(status))
+            throw NSError(domain: "Ceburu.Keychain", code: Int(status))
         }
 
         try save(data)
         return SymmetricKey(data: data)
     }
 
+    /// Attempts to load the key from the Keychain. Returns `nil` if not found.
+    ///
+    /// - Throws: If the Keychain query returns an error other than `errSecItemNotFound`.
     private static func load() throws -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -401,11 +539,19 @@ enum KeyStore {
 
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess else {
-            throw NSError(domain: "MobileOTel.Keychain", code: Int(status))
+            throw NSError(domain: "Ceburu.Keychain", code: Int(status))
         }
         return result as? Data
     }
 
+    /// Saves key material to the Keychain, replacing any existing item.
+    ///
+    /// Uses `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` so the key is available
+    /// after the first unlock (covers background crash imports on next launch) but is
+    /// never migrated to another device.
+    ///
+    /// - Parameter data: 32-byte raw key material.
+    /// - Throws: If `SecItemAdd` returns an error.
     private static func save(_ data: Data) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -419,7 +565,7 @@ enum KeyStore {
 
         let status = SecItemAdd(query as CFDictionary, nil)
         guard status == errSecSuccess else {
-            throw NSError(domain: "MobileOTel.Keychain", code: Int(status))
+            throw NSError(domain: "Ceburu.Keychain", code: Int(status))
         }
     }
 }
