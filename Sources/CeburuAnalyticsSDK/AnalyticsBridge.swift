@@ -49,10 +49,18 @@ actor AnalyticsBridge {
     /// Builds the three OpenTelemetry signal pipelines and registers them with the global
     /// `OpenTelemetry` instance.
     ///
-    /// - Parameter config: SDK configuration. `collectorHost`/`collectorPort` determine the gRPC target.
-    ///   `authToken` is embedded as the `authorization` gRPC metadata header via `OtlpConfiguration`.
+    /// - Parameters:
+    ///   - config:      SDK configuration. `collectorHost`/`collectorPort` determine the gRPC target.
+    ///                  `authToken` is embedded as the `authorization` gRPC metadata header via `OtlpConfiguration`.
+    ///   - deviceModel: Device model string resolved by the caller (e.g. `UIDevice.current.model`).
+    ///                  Passed in because `UIDevice` requires the main actor and `init` is synchronous.
+    ///   - osName:      Human-readable OS name (`"iOS"`, `"macOS"`).
+    ///   - osVersion:   OS version string (`UIDevice.current.systemVersion` or `ProcessInfo` equivalent).
     /// - Throws: If NIO event-loop group or gRPC channel cannot be created.
-    init(config: CeburuAnalyticsSDK.Config) throws {
+    init(config: CeburuAnalyticsSDK.Config,
+         deviceModel: String,
+         osName: String,
+         osVersion: String) throws {
         self.currentToken = config.authToken
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -65,7 +73,21 @@ actor AnalyticsBridge {
             "deployment.environment.name":    AttributeValue.string(config.environment),
             "tenant.id":                      AttributeValue.string(config.tenantId),
             "application.id":                 AttributeValue.string(config.applicationId),
-            "user.id":                        AttributeValue.string(config.userId)
+            "enduser.id":                     AttributeValue.string(config.userId),
+            // Unique per SDK init — lets the backend distinguish individual device
+            // instances that share the same service.name and service.version.
+            "service.instance.id":            AttributeValue.string(UUID().uuidString),
+            // Device and OS — resource-level so every span and metric carries them,
+            // not just the first log event. Resolved by CeburuAnalyticsSDK.initialize()
+            // before this init is called (UIDevice requires the main actor).
+            "device.manufacturer":            AttributeValue.string("Apple"),
+            "device.model.name":              AttributeValue.string(deviceModel),
+            "os.type":                        AttributeValue.string("darwin"),
+            "os.name":                        AttributeValue.string(osName),
+            "os.version":                     AttributeValue.string(osVersion),
+            "telemetry.sdk.name":             AttributeValue.string(CeburuAnalyticsSDK.sdkName),
+            "telemetry.sdk.version":          AttributeValue.string(CeburuAnalyticsSDK.sdkVersion),
+            "telemetry.sdk.language":         AttributeValue.string("swift") // fixed — always a Swift/Apple SDK
         ])
 
         let otlpHeaders: [(String, String)]? = config.authToken.isEmpty
@@ -84,9 +106,12 @@ actor AnalyticsBridge {
         OpenTelemetry.registerLoggerProvider(loggerProvider: loggerProvider)
 
         self.logProcessor = logProcessor
+        // Instrumentation scope identifies which SDK library produced each signal.
+        // Uses sdkName/sdkVersion constants so the scope stays in sync with the
+        // published artifact version without requiring manual updates here.
         self.logger = OpenTelemetry.instance.loggerProvider
-            .loggerBuilder(instrumentationScopeName: "enterprise.mobile.sdk")
-            .setInstrumentationVersion("2.0.0")
+            .loggerBuilder(instrumentationScopeName: CeburuAnalyticsSDK.sdkName)
+            .setInstrumentationVersion(CeburuAnalyticsSDK.sdkVersion)
             .build()
 
         // ── Metrics pipeline ───────────────────────────────────────────────────
@@ -108,13 +133,17 @@ actor AnalyticsBridge {
             )
             .build()
         OpenTelemetry.registerMeterProvider(meterProvider: meterProvider)
-        self.meterSdk = meterProvider.get(name: "enterprise.mobile.sdk")
+        self.meterSdk = meterProvider.get(name: CeburuAnalyticsSDK.sdkName)
 
-        let sdkMeter = meterProvider.get(name: "enterprise.mobile.sdk.internal")
-        self.sdkEventsEmittedCounter = sdkMeter.counterBuilder(name: "mobile.sdk.events.emitted").build()
-        self.sdkEventsDroppedCounter = sdkMeter.counterBuilder(name: "mobile.sdk.events.dropped").build()
-        self.sdkExportSuccessCounter = sdkMeter.counterBuilder(name: "mobile.sdk.export.success").build()
-        self.sdkExportFailureCounter = sdkMeter.counterBuilder(name: "mobile.sdk.export.failure").build()
+        let sdkMeter = meterProvider.get(name: "\(CeburuAnalyticsSDK.sdkName).internal")
+        self.sdkEventsEmittedCounter = sdkMeter.counterBuilder(name: "mobile.sdk.events.emitted")
+            .setUnit("{event}").build()
+        self.sdkEventsDroppedCounter = sdkMeter.counterBuilder(name: "mobile.sdk.events.dropped")
+            .setUnit("{event}").build()
+        self.sdkExportSuccessCounter = sdkMeter.counterBuilder(name: "mobile.sdk.export.success")
+            .setUnit("{batch}").build()
+        self.sdkExportFailureCounter = sdkMeter.counterBuilder(name: "mobile.sdk.export.failure")
+            .setUnit("{batch}").build()
 
         // ── Traces pipeline ────────────────────────────────────────────────────
         let spanExporter  = OtlpTraceExporter(channel: connection, config: otlpConfig)
@@ -127,8 +156,8 @@ actor AnalyticsBridge {
         OpenTelemetry.registerTracerProvider(tracerProvider: tracerProvider)
 
         self.tracer = OpenTelemetry.instance.tracerProvider.get(
-            instrumentationName:    "enterprise.mobile.sdk",
-            instrumentationVersion: "2.0.0"
+            instrumentationName:    CeburuAnalyticsSDK.sdkName,
+            instrumentationVersion: CeburuAnalyticsSDK.sdkVersion
         )
 
         self.group      = group
@@ -219,10 +248,12 @@ actor AnalyticsBridge {
     ///   - name:  Instrument name (e.g. `"checkout.attempts"`).
     ///   - value: Amount to add (must be ≥ 0 for counters).
     ///   - attrs: Attributes attached to this individual data point.
-    func incrementCounter(name: String, value: Int64, attrs: [String: String]) {
+    func incrementCounter(name: String, value: Int64, attrs: [String: String], unit: String = "") {
         guard let meterSdk else { return }
         let counter = appCounters[name] ?? {
-            let c = meterSdk.counterBuilder(name: name).build()
+            let builder = meterSdk.counterBuilder(name: name)
+            if !unit.isEmpty { builder.setUnit(unit) }
+            let c = builder.build()
             appCounters[name] = c
             return c
         }()
@@ -239,10 +270,12 @@ actor AnalyticsBridge {
     ///   - name:  Instrument name (e.g. `"active.downloads"`).
     ///   - value: Delta — positive to add, negative to subtract.
     ///   - attrs: Attributes attached to this individual data point.
-    func incrementUpDownCounter(name: String, value: Int64, attrs: [String: String]) {
+    func incrementUpDownCounter(name: String, value: Int64, attrs: [String: String], unit: String = "") {
         guard let meterSdk else { return }
         let counter = appUpDownCounters[name] ?? {
-            let c = meterSdk.upDownCounterBuilder(name: name).build()
+            let builder = meterSdk.upDownCounterBuilder(name: name)
+            if !unit.isEmpty { builder.setUnit(unit) }
+            let c = builder.build()
             appUpDownCounters[name] = c
             return c
         }()
@@ -259,10 +292,12 @@ actor AnalyticsBridge {
     ///   - name:  Instrument name (e.g. `"api.response.ms"`).
     ///   - value: Measured value (must be ≥ 0).
     ///   - attrs: Attributes attached to this individual data point.
-    func recordHistogram(name: String, value: Double, attrs: [String: String]) {
+    func recordHistogram(name: String, value: Double, attrs: [String: String], unit: String = "") {
         guard let meterSdk else { return }
         let histogram = appHistograms[name] ?? {
-            let h = meterSdk.histogramBuilder(name: name).build()
+            let builder = meterSdk.histogramBuilder(name: name)
+            if !unit.isEmpty { builder.setUnit(unit) }
+            let h = builder.build()
             appHistograms[name] = h
             return h
         }()
@@ -279,12 +314,14 @@ actor AnalyticsBridge {
     ///   - name:     Instrument name (e.g. `"app.sessions.total"`).
     ///   - callback: Returns the current cumulative count. Must be cheap and non-blocking —
     ///               it runs on the metrics export thread.
-    func observeCounter(name: String, callback: @Sendable @escaping () -> Int64) {
+    func observeCounter(name: String, callback: @Sendable @escaping () -> Int64, unit: String = "") {
         guard let meterSdk else { return }
         // ObservableMeasurementSdk.record(value:Int) always converts to Double, so
         // LongSumAggregator.toPoint() would read longValue=0. Using .ofDoubles() selects
         // DoubleSumAggregator which correctly reads doubleValue.
-        let instrument = meterSdk.counterBuilder(name: name)
+        let cBuilder = meterSdk.counterBuilder(name: name)
+        if !unit.isEmpty { cBuilder.setUnit(unit) }
+        let instrument = cBuilder
             .ofDoubles()
             .buildWithCallback { measurement in
                 measurement.record(value: Double(callback()), attributes: [:])
@@ -301,9 +338,11 @@ actor AnalyticsBridge {
     ///   - name:     Instrument name (e.g. `"memory.used.mb"`).
     ///   - callback: Returns the current value. Must be cheap and non-blocking —
     ///               it runs on the metrics export thread.
-    func observeGauge(name: String, callback: @Sendable @escaping () -> Double) {
+    func observeGauge(name: String, callback: @Sendable @escaping () -> Double, unit: String = "") {
         guard let meterSdk else { return }
-        let instrument = meterSdk.gaugeBuilder(name: name)
+        let gBuilder = meterSdk.gaugeBuilder(name: name)
+        if !unit.isEmpty { gBuilder.setUnit(unit) }
+        let instrument = gBuilder
             .buildWithCallback { measurement in
                 measurement.record(value: callback(), attributes: [:])
             }

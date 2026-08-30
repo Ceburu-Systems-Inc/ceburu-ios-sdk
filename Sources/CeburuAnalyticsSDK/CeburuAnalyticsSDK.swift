@@ -18,6 +18,14 @@ public actor CeburuAnalyticsSDK {
     /// The singleton instance. Use this everywhere — do not create additional instances.
     public static let shared = CeburuAnalyticsSDK()
 
+    // ── SDK identity constants ─────────────────────────────────────────────────
+    // Single source of truth for SDK name and version.
+    // Referenced by AnalyticsBridge when building the OTel Resource so that
+    // telemetry.sdk.name and telemetry.sdk.version are always in sync with
+    // the published artifact version without requiring manual updates in multiple places.
+    static let sdkName    = "ceburu-analytics-sdk"
+    static let sdkVersion = "2.0.0"
+
     // ── Severity ───────────────────────────────────────────────────────────────
 
     /// Log severity levels in ascending order of criticality.
@@ -207,13 +215,22 @@ public actor CeburuAnalyticsSDK {
 
         /// Records an error, marks the span status as `ERROR`, and ends it. Call exactly once.
         ///
-        /// Sets `exception.message` and `span.status = ERROR` before closing the span.
-        /// Use this instead of ``end()`` whenever the operation failed.
+        /// Records exception details as a span **event** named `"exception"` per OTel semconv —
+        /// this makes the exception appear as a timed point in the trace waterfall, matching
+        /// what Android's `span.recordException(throwable)` produces on the JVM side.
+        /// Then sets `span.status = ERROR` and closes the span.
         ///
         /// - Parameter error: The error that caused the failure. Its `localizedDescription` is recorded.
         public func endWithError(_ error: Error) {
-            span?.setAttribute(key: SemanticAttributes.exceptionMessage.rawValue,
-                               value: AttributeValue.string(error.localizedDescription))
+            // OTel semconv: exceptions go on a span event, not span attributes.
+            // exception.escaped = true because this error is ending the span's scope.
+            span?.addEvent(name: "exception", attributes: [
+                "exception.type":       AttributeValue.string(String(describing: type(of: error))),
+                "exception.message":    AttributeValue.string(error.localizedDescription),
+                // Stack symbols captured at call time — closest Swift equivalent to a JVM stack trace.
+                "exception.stacktrace": AttributeValue.string(Thread.callStackSymbols.joined(separator: "\n")),
+                "exception.escaped":    AttributeValue.bool(true)
+            ])
             span?.status = Status.error(description: error.localizedDescription)
             span?.end()
         }
@@ -259,11 +276,30 @@ public actor CeburuAnalyticsSDK {
     public func initialize(config: Config) async throws {
         guard !running else { return }
 
+        // Resolve device info before creating the bridge — AnalyticsBridge.init is
+        // synchronous so it cannot call UIDevice itself. These values go into the
+        // OTel Resource so every span and metric (not just the init log event) carries
+        // device and OS context.
+        #if canImport(UIKit)
+        let deviceModel = await UIDevice.current.model
+        let osVersion   = await UIDevice.current.systemVersion
+        let osName      = "iOS"
+        #else
+        let deviceModel = "Mac"
+        let osVersion   = ProcessInfo.processInfo.operatingSystemVersionString
+        let osName      = "macOS"
+        #endif
+
         let storage = try EncryptedStore(
             maxBytes:       config.queueMaxBytes,
             retentionHours: config.retentionHours
         )
-        let bridge = try AnalyticsBridge(config: config)
+        let bridge = try AnalyticsBridge(
+            config:      config,
+            deviceModel: deviceModel,
+            osName:      osName,
+            osVersion:   osVersion
+        )
 
         self.config  = config
         self.storage = storage
@@ -298,16 +334,6 @@ public actor CeburuAnalyticsSDK {
             }
         }
 
-        #if canImport(UIKit)
-        let deviceModel = await UIDevice.current.model
-        let osVersion   = await UIDevice.current.systemVersion
-        let osName      = "iOS"
-        #else
-        let deviceModel = "Mac"
-        let osVersion   = ProcessInfo.processInfo.operatingSystemVersionString
-        let osName      = "macOS"
-        #endif
-
         await info(
             "Mobile SDK initialized",
             attributes: [
@@ -317,7 +343,8 @@ public actor CeburuAnalyticsSDK {
                 "tenant.id":                   config.tenantId,
                 "application.id":              config.applicationId,
                 "device.manufacturer":         "Apple",
-                "device.model":                deviceModel,
+                "device.model.name":           deviceModel,
+                "os.type":                     "darwin",
                 "os.name":                     osName,
                 "os.version":                  osVersion
             ]
@@ -498,12 +525,15 @@ public actor CeburuAnalyticsSDK {
     ///   - name:  Instrument name (e.g. `"checkout.attempts"`). Consistent across calls.
     ///   - value: Amount to add. Must be ≥ 0.
     ///   - attrs: Attributes attached to this data point only (not to the instrument definition).
+    ///   - unit:  Optional UCUM unit for the instrument (e.g. `"{request}"`, `"ms"`). Pass once on
+    ///            first call — subsequent calls with the same name reuse the existing instrument.
     public func incrementCounter(
         name:  String,
         value: Int64 = 1,
-        attrs: [String: String] = [:]
+        attrs: [String: String] = [:],
+        unit:  String = ""
     ) async {
-        await bridge?.incrementCounter(name: name, value: value, attrs: attrs)
+        await bridge?.incrementCounter(name: name, value: value, attrs: attrs, unit: unit)
     }
 
     /// Increments (or decrements) a named up-down counter.
@@ -521,12 +551,14 @@ public actor CeburuAnalyticsSDK {
     ///   - name:  Instrument name. Consistent across add and subtract calls.
     ///   - value: Delta — positive to add, negative to subtract.
     ///   - attrs: Attributes attached to this data point only.
+    ///   - unit:  Optional UCUM unit (e.g. `"{session}"`). Effective only on first call per name.
     public func incrementUpDownCounter(
         name:  String,
         value: Int64 = 1,
-        attrs: [String: String] = [:]
+        attrs: [String: String] = [:],
+        unit:  String = ""
     ) async {
-        await bridge?.incrementUpDownCounter(name: name, value: value, attrs: attrs)
+        await bridge?.incrementUpDownCounter(name: name, value: value, attrs: attrs, unit: unit)
     }
 
     /// Records a measurement into a named histogram.
@@ -545,12 +577,14 @@ public actor CeburuAnalyticsSDK {
     ///   - name:  Instrument name (e.g. `"api.response.ms"`). Consistent across calls.
     ///   - value: Measured value (must be ≥ 0 for histograms).
     ///   - attrs: Attributes attached to this data point only.
+    ///   - unit:  Optional UCUM unit (e.g. `"ms"`, `"By"`). Effective only on first call per name.
     public func recordHistogram(
         name:  String,
         value: Double,
-        attrs: [String: String] = [:]
+        attrs: [String: String] = [:],
+        unit:  String = ""
     ) async {
-        await bridge?.recordHistogram(name: name, value: value, attrs: attrs)
+        await bridge?.recordHistogram(name: name, value: value, attrs: attrs, unit: unit)
     }
 
     /// Registers a callback polled every 60 s and reported as a cumulative counter.
@@ -566,8 +600,9 @@ public actor CeburuAnalyticsSDK {
     /// - Parameters:
     ///   - name:     Instrument name (e.g. `"app.sessions.total"`).
     ///   - callback: Returns the current cumulative count. Called every 60 s.
-    public func observeCounter(name: String, callback: @Sendable @escaping () -> Int64) async {
-        await bridge?.observeCounter(name: name, callback: callback)
+    ///   - unit:     Optional UCUM unit (e.g. `"{session}"`).
+    public func observeCounter(name: String, callback: @Sendable @escaping () -> Int64, unit: String = "") async {
+        await bridge?.observeCounter(name: name, callback: callback, unit: unit)
     }
 
     /// Registers a callback polled every 60 s and reported as a gauge (point-in-time value).
@@ -585,8 +620,9 @@ public actor CeburuAnalyticsSDK {
     /// - Parameters:
     ///   - name:     Instrument name (e.g. `"memory.used.mb"`).
     ///   - callback: Returns the current value. Called every 60 s.
-    public func observeGauge(name: String, callback: @Sendable @escaping () -> Double) async {
-        await bridge?.observeGauge(name: name, callback: callback)
+    ///   - unit:     Optional UCUM unit (e.g. `"MiBy"`, `"{thread}"`).
+    public func observeGauge(name: String, callback: @Sendable @escaping () -> Double, unit: String = "") async {
+        await bridge?.observeGauge(name: name, callback: callback, unit: unit)
     }
 
     // ── Traces ─────────────────────────────────────────────────────────────────
@@ -685,7 +721,7 @@ public actor CeburuAnalyticsSDK {
         attrs["application.id"]              = config.applicationId
 
         // Inject user identity when set — links every event to the current user.
-        if !userId.isEmpty { attrs["user.id"] = userId }
+        if !userId.isEmpty { attrs["enduser.id"] = userId }
 
         if severity.rawValue >= Severity.error.rawValue && !breadcrumbs.isEmpty {
             attrs["session.breadcrumbs"] = breadcrumbs
