@@ -37,7 +37,7 @@ struct MyApp: App {
                 config: CeburuAnalyticsSDK.Config(
                     // ── Required ──────────────────────────────────────────
                     serviceName:    "MyApp",
-                    serviceVersion: "1.0.2",
+                    serviceVersion: "x.x.x",
                     environment:    "production",
                     tenantId:       "<your-tenant-id>",        // provided by account team
                     applicationId:  "<your-application-id>",   // provided by account team
