@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 #if canImport(UIKit)
 import UIKit
@@ -24,7 +25,7 @@ public actor CeburuAnalyticsSDK {
     // telemetry.sdk.name and telemetry.sdk.version are always in sync with
     // the published artifact version without requiring manual updates in multiple places.
     static let sdkName    = "ceburu-analytics-sdk"
-    static let sdkVersion = "2.0.0"
+    static let sdkVersion = "3.0.0"
 
     // ── Severity ───────────────────────────────────────────────────────────────
 
@@ -75,10 +76,16 @@ public actor CeburuAnalyticsSDK {
         public let tenantId:        String
         /// Application bundle identifier. Provided by your account team.
         public let applicationId:   String
-        /// gRPC collector host. Provided by your account team (e.g. `"collector.ceburu.io"`).
+        /// Configuration identifier. Routes data to the correct tenant index in the collector.
+        /// Provided by your account team. Without this, data lands in the tenant default index.
+        public let configId:        String
+        /// OTLP/HTTP collector host. Provided by your account team (e.g. `"ingest.ceburu.io"`).
         public let collectorHost:   String
-        /// gRPC collector port. Defaults to `4317` (standard OTLP/gRPC port).
+        /// OTLP/HTTP collector port. Defaults to `4318` (standard OTLP/HTTP port).
         public let collectorPort:   Int
+        /// Whether to use HTTPS for collector connections. Default: `true`.
+        /// Set to `false` only for local development against an HTTP collector.
+        public let useHTTPS:        Bool
         /// Maximum on-device encrypted queue size in bytes. Oldest events are evicted when full.
         /// Default: 50 MB.
         public let queueMaxBytes:   Int
@@ -92,8 +99,8 @@ public actor CeburuAnalyticsSDK {
         /// Initial user identity. Applied before the first log event so `user.id` appears
         /// even on the "SDK initialized" event. Update at runtime with ``CeburuAnalyticsSDK/setUser(_:)``.
         public let userId:          String
-        /// Customer-provided Bearer token. Applied as the `authorization` gRPC metadata header.
-        /// Rotate at runtime with ``CeburuAnalyticsSDK/updateAuthToken(_:)``.
+        /// Customer-provided Bearer token. Applied as the `authorization` HTTP header on
+        /// every export request. Rotate at runtime with ``CeburuAnalyticsSDK/updateAuthToken(_:)``.
         public let authToken:       String
         /// How often (in seconds) observable metrics are polled and exported.
         /// Default: 60 s. Reduce to 10 s during development for faster feedback.
@@ -107,8 +114,10 @@ public actor CeburuAnalyticsSDK {
         ///   - environment:           Deployment tier — `"production"`, `"staging"`, etc.
         ///   - tenantId:              Tenant identifier (from account team).
         ///   - applicationId:         Bundle identifier (from account team).
-        ///   - collectorHost:         gRPC collector host (from account team).
-        ///   - collectorPort:         gRPC port. Defaults to `4317`.
+        ///   - configId:              Configuration identifier for tenant routing (from account team).
+        ///   - collectorHost:         OTLP/HTTP collector host (from account team).
+        ///   - collectorPort:         OTLP/HTTP port. Defaults to `4318`.
+        ///   - useHTTPS:              Use HTTPS. Defaults to `true`. Set `false` for local dev only.
         ///   - queueMaxBytes:         On-device queue limit. Defaults to 50 MB.
         ///   - retentionHours:        Offline retention window. Defaults to 72 h.
         ///   - maxBatchEvents:        Events per export batch. Defaults to 200.
@@ -122,8 +131,10 @@ public actor CeburuAnalyticsSDK {
             environment:           String,
             tenantId:              String,
             applicationId:         String,
+            configId:              String       = "",
             collectorHost:         String,
-            collectorPort:         Int          = 4317,
+            collectorPort:         Int          = 4318,
+            useHTTPS:              Bool         = true,
             queueMaxBytes:         Int          = 50 * 1024 * 1024,
             retentionHours:        Int          = 72,
             maxBatchEvents:        Int          = 200,
@@ -137,8 +148,10 @@ public actor CeburuAnalyticsSDK {
             self.environment           = environment
             self.tenantId              = tenantId
             self.applicationId         = applicationId
+            self.configId              = configId
             self.collectorHost         = collectorHost
             self.collectorPort         = collectorPort
+            self.useHTTPS              = useHTTPS
             self.queueMaxBytes         = queueMaxBytes
             self.retentionHours        = retentionHours
             self.maxBatchEvents        = maxBatchEvents
@@ -210,6 +223,7 @@ public actor CeburuAnalyticsSDK {
         /// After this call the span is immutable and queued for export. Further attribute
         /// mutations or `addEvent` calls on this handle are silently ignored.
         public func end() {
+            if let span { OpenTelemetry.instance.contextProvider.removeContextForSpan(span) }
             span?.end()
         }
 
@@ -232,6 +246,7 @@ public actor CeburuAnalyticsSDK {
                 "exception.escaped":    AttributeValue.bool(true)
             ])
             span?.status = Status.error(description: error.localizedDescription)
+            if let span { OpenTelemetry.instance.contextProvider.removeContextForSpan(span) }
             span?.end()
         }
     }
@@ -252,6 +267,9 @@ public actor CeburuAnalyticsSDK {
     nonisolated(unsafe) private static var _crashStorage:    EncryptedStore?
     nonisolated(unsafe) private static var _crashSessionId:  String = ""
     nonisolated(unsafe) static var _crashBreadcrumbs:        String = ""
+    // H-3: previous uncaught-exception handler (e.g. Crashlytics, Sentry) chained after ours.
+    // Must be a static so it is accessible from a @convention(c) closure without capturing context.
+    nonisolated(unsafe) private static var _previousExceptionHandler: (@convention(c) (NSException) -> Void)? = nil
 
     private init() {}
 
@@ -264,14 +282,14 @@ public actor CeburuAnalyticsSDK {
     ///
     /// What this does:
     /// 1. Creates the encrypted on-device queue and crash directory.
-    /// 2. Builds the three OpenTelemetry signal pipelines (logs, metrics, traces) over gRPC.
+    /// 2. Builds the three OpenTelemetry signal pipelines (logs, metrics, traces) over OTLP/HTTP.
     /// 3. Imports any crash records persisted during a previous session and re-queues them as `fatal` events.
     /// 4. Installs `NSSetUncaughtExceptionHandler` and the POSIX signal handler for crash reporting.
     /// 5. Starts a background `Task` that flushes the queue with exponential backoff on failure.
     /// 6. Emits an `"Mobile SDK initialized"` info event with device and config metadata.
     ///
     /// - Parameter config: SDK configuration. See ``Config`` for field descriptions.
-    /// - Throws: If the encrypted store or the gRPC bridge cannot be created
+    /// - Throws: If the encrypted store or the OTLP/HTTP bridge cannot be created
     ///           (e.g. Keychain unavailable, invalid host).
     public func initialize(config: Config) async throws {
         guard !running else { return }
@@ -281,7 +299,15 @@ public actor CeburuAnalyticsSDK {
         // OTel Resource so every span and metric (not just the init log event) carries
         // device and OS context.
         #if canImport(UIKit)
-        let deviceModel = await UIDevice.current.model
+        // H-5: UIDevice.current.model returns the generic string "iPhone".
+        // sysctlbyname("hw.machine") returns the specific hardware model identifier
+        // (e.g. "iPhone15,2"), which the Ceburu backend uses to correlate crash
+        // patterns by hardware revision and distinguish capability tiers.
+        var machineSize = 0
+        sysctlbyname("hw.machine", nil, &machineSize, nil, 0)
+        var machineBuf = [CChar](repeating: 0, count: machineSize)
+        sysctlbyname("hw.machine", &machineBuf, &machineSize, nil, 0)
+        let deviceModel = String(cString: machineBuf)
         let osVersion   = await UIDevice.current.systemVersion
         let osName      = "iOS"
         #else
@@ -386,15 +412,14 @@ public actor CeburuAnalyticsSDK {
         self.userId = userId
     }
 
-    /// Stores a new Bearer token for authenticating gRPC export requests.
+    /// Replaces the Bearer token and immediately rebuilds all three export pipelines.
     ///
-    /// The token is applied to gRPC `CallOptions` on the next connection — not mid-stream.
-    /// This is a known limitation of iOS gRPC: `CallOptions` are set at connection time,
-    /// so the new token takes effect when the current connection is recycled.
+    /// Any in-flight data in the old pipelines is flushed before the new token is applied,
+    /// so no events are lost during rotation. The very next export request uses the new token.
     ///
     /// - Parameter token: The replacement Bearer token. Pass an empty string to remove auth.
-    public func updateAuthToken(_ token: String) async {
-        await bridge?.updateToken(token)
+    public func updateAuthToken(_ token: String) async throws {
+        try await bridge?.updateToken(token)
     }
 
     // ── Session ────────────────────────────────────────────────────────────────
@@ -671,7 +696,7 @@ public actor CeburuAnalyticsSDK {
     /// 1. Uninstalls all registered logger adapters, restoring the original logging chain.
     /// 2. Sets `running = false` to stop the flush loop.
     /// 3. Uninstalls the POSIX signal handler.
-    /// 4. Shuts down the gRPC bridge (flushes in-flight batches and closes the connection).
+    /// 4. Shuts down the OTLP/HTTP bridge (flushes in-flight batches and closes the connection).
     ///
     /// After `shutdown()` the SDK can be re-initialized by calling ``initialize(config:)`` again.
     /// Normally you do not need to call this — it is provided for testing and graceful app teardown.
@@ -679,7 +704,7 @@ public actor CeburuAnalyticsSDK {
     ///
     /// Useful during development to verify observable metrics (gauge/counter) are reaching
     /// the collector without waiting for the next scheduled interval.
-    /// Forces an immediate metric collection and gRPC export.
+    /// Forces an immediate metric collection and OTLP/HTTP export.
     /// - Returns: `true` if the export was accepted by the collector, `false` if the connection was refused or timed out.
     @discardableResult
     public func flushMetrics() async -> Bool {
@@ -729,6 +754,20 @@ public actor CeburuAnalyticsSDK {
                 .joined(separator: " | ")
         }
 
+        // Capture the span context that is active on this Task so logs emitted
+        // inside a span carry trace_id/span_id in the OTLP payload.  The IDs
+        // survive serialisation to disk: even events flushed on the next launch
+        // reconstruct the SpanContext correctly in emitBatch().
+        var traceId: String? = nil
+        var spanId:  String? = nil
+        if let activeSpan = OpenTelemetry.instance.contextProvider.activeSpan {
+            let ctx = activeSpan.context
+            if ctx.isValid {
+                traceId = ctx.traceId.hexString
+                spanId  = ctx.spanId.hexString
+            }
+        }
+
         let event = Event(
             eventId:         UUID().uuidString,
             timestampUnixMs: Int64(Date().timeIntervalSince1970 * 1000),
@@ -736,7 +775,9 @@ public actor CeburuAnalyticsSDK {
             type:            "log",
             message:         message,
             sessionId:       sessionId,
-            attributes:      attrs
+            attributes:      attrs,
+            traceId:         traceId,
+            spanId:          spanId
         )
 
         do {
@@ -760,29 +801,34 @@ public actor CeburuAnalyticsSDK {
                 maxBytes:  policy.maxBatchBytes
             )
             if rows.isEmpty { return .empty }
-            var successCount = 0
+
+            // Decode all events first; discard any with corrupt JSON so they never block
+            // the queue. Decryption failures are handled inside storage.batch() (B-4 fix).
+            var validFiles:  [URL]   = []
+            var validEvents: [Event] = []
             for (file, clear) in rows {
-                let event: Event
                 do {
-                    event = try JSONDecoder().decode(Event.self, from: clear)
+                    validEvents.append(try JSONDecoder().decode(Event.self, from: clear))
+                    validFiles.append(file)
                 } catch {
-                    // Corrupt or undecodable event — acknowledge (delete) it so it never
-                    // blocks the queue again. Count as dropped, not as an export failure.
-                    await storage.acknowledge([file])
-                    continue
-                }
-                let ok = await bridge.emit(event)
-                if ok {
-                    successCount += 1
-                    await storage.acknowledge([file])
-                } else {
-                    if successCount > 0 { await bridge.recordExportSuccess(eventCount: successCount) }
-                    await bridge.recordExportFailure()
-                    return .failed
+                    await storage.acknowledge([file])  // corrupt JSON — discard
                 }
             }
-            await bridge.recordExportSuccess(eventCount: successCount)
-            return .flushed
+
+            if validEvents.isEmpty { return .empty }
+
+            // Export the whole batch in one OTLP/HTTP request and wait for HTTP 2xx.
+            // Only delete from disk AFTER confirmed delivery — fixing the offline data-loss
+            // defect where files were deleted on hand-off to the in-memory exporter.
+            let ok = await bridge.emitBatch(validEvents)
+            if ok {
+                await storage.acknowledge(validFiles)
+                await bridge.recordExportSuccess(eventCount: validEvents.count)
+                return .flushed
+            } else {
+                await bridge.recordExportFailure()
+                return .failed
+            }
         } catch {
             return .failed
         }
@@ -793,9 +839,13 @@ public actor CeburuAnalyticsSDK {
         CeburuAnalyticsSDK._crashStorage   = storage
         CeburuAnalyticsSDK._crashSessionId = sessionId
 
+        // H-3: preserve any existing handler (e.g. Crashlytics, Sentry).
+        // Stored in a static — @convention(c) closures cannot capture stack locals.
+        CeburuAnalyticsSDK._previousExceptionHandler = NSGetUncaughtExceptionHandler()
         NSSetUncaughtExceptionHandler { exception in
             CeburuAnalyticsSDK._crashStorage?.persistException(exception, sessionId: CeburuAnalyticsSDK._crashSessionId)
             SignalCrashHandler.exceptionAlreadyCaptured = true
+            CeburuAnalyticsSDK._previousExceptionHandler?(exception)
         }
     }
 
@@ -806,8 +856,11 @@ public actor CeburuAnalyticsSDK {
     private func mergeError(_ attrs: [String: Any], _ error: Error?) -> [String: Any] {
         guard let error else { return attrs }
         var out = attrs
-        out["exception.type"]    = String(describing: type(of: error))
-        out["exception.message"] = error.localizedDescription
+        out["exception.type"]       = String(describing: type(of: error))
+        out["exception.message"]    = error.localizedDescription
+        // H-4: capture stack symbols at the call site so error() and fatal() carry
+        // a stacktrace, matching what crash records and span.endWithError() already provide.
+        out["exception.stacktrace"] = Thread.callStackSymbols.joined(separator: "\n")
         return out
     }
 
@@ -824,6 +877,10 @@ public actor CeburuAnalyticsSDK {
         let message:         String
         let sessionId:       String
         let attributes:      [String: String]
+        // Span context captured at enqueue time. nil when no span was active.
+        // Optional so old on-disk events (without these keys) decode cleanly.
+        let traceId:         String?
+        let spanId:          String?
     }
 
     struct Policy: Sendable {

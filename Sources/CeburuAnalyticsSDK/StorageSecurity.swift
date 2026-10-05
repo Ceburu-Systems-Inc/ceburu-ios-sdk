@@ -82,7 +82,7 @@ struct RetryBackoff {
 ///
 /// Each event is individually encrypted and written as a `.bin` file named
 /// `<timestampMs>_<eventId>.bin`. Files are ordered by name (timestamp) on read,
-/// so the queue is naturally FIFO. Crash records are stored as `.json` files in a
+/// so the queue is naturally FIFO. Crash records are stored as AES-256-GCM `.enc` files in a
 /// separate `Ceburu/Crashes` directory.
 ///
 /// **Encryption**: AES-GCM with a 256-bit key generated once per install and stored
@@ -175,9 +175,18 @@ actor EncryptedStore {
         for url in queueFiles() {
             if result.count >= maxEvents { break }
 
-            let encrypted = try Data(contentsOf: url)
-            let sealed = try AES.GCM.SealedBox(combined: encrypted)
-            let clear = try AES.GCM.open(sealed, using: key)
+            // Skip and delete any file that fails to decrypt rather than throwing.
+            // A single corrupt file previously caused batch() to throw on every call,
+            // blocking the queue permanently. Treating it as a discard keeps the queue draining.
+            let clear: Data
+            do {
+                let encrypted = try Data(contentsOf: url)
+                let sealed    = try AES.GCM.SealedBox(combined: encrypted)
+                clear         = try AES.GCM.open(sealed, using: key)
+            } catch {
+                try? FileManager.default.removeItem(at: url)
+                continue
+            }
 
             if total + clear.count > maxBytes && !result.isEmpty { break }
 
@@ -206,15 +215,19 @@ actor EncryptedStore {
     ///
     /// - Parameter text: Serialized breadcrumb string (pipe-separated `"category:message"` pairs).
     nonisolated func persistBreadcrumbs(_ text: String) {
-        let file = crashDir.appendingPathComponent("breadcrumbs.txt")
-        try? text.data(using: .utf8)?.write(to: file, options: [.atomic])
+        guard let plain = text.data(using: .utf8) else { return }
+        let file = crashDir.appendingPathComponent("breadcrumbs.enc")
+        if let sealed = try? AES.GCM.seal(plain, using: EncryptedStore.crashKey()),
+           let encrypted = sealed.combined {
+            try? encrypted.write(to: file, options: [.atomic, .completeFileProtection])
+        }
     }
 
     /// Persists an `NSException` to disk for next-launch delivery.
     ///
-    /// Called from `NSSetUncaughtExceptionHandler` — a synchronous C callback that fires
-    /// on the crashing thread. Uses only Foundation JSON serialization (no async).
-    /// `nonisolated` to avoid actor-isolation overhead at crash time.
+    /// Called from `NSSetUncaughtExceptionHandler` — a safe (non-signal) synchronous callback.
+    /// Crash record is AES-256-GCM encrypted using a key derived from the bundle ID so that
+    /// stack traces and breadcrumbs are never stored in plaintext.
     ///
     /// - Parameters:
     ///   - exception: The uncaught Objective-C exception.
@@ -229,18 +242,28 @@ actor EncryptedStore {
             "breadcrumbs": CeburuAnalyticsSDK._crashBreadcrumbs
         ]
 
-        if let data = try? JSONSerialization.data(withJSONObject: object) {
-            let file = crashDir.appendingPathComponent(
-                "\(Date().timeIntervalSince1970)_\(UUID().uuidString).json"
-            )
-            try? data.write(to: file, options: [.atomic])
-        }
+        guard let plain = try? JSONSerialization.data(withJSONObject: object),
+              let sealed = try? AES.GCM.seal(plain, using: EncryptedStore.crashKey()),
+              let encrypted = sealed.combined else { return }
+
+        let file = crashDir.appendingPathComponent(
+            "\(Date().timeIntervalSince1970)_\(UUID().uuidString).enc"
+        )
+        try? encrypted.write(to: file, options: [.atomic, .completeFileProtection])
+    }
+
+    // Deterministic AES-256-GCM key for crash records — derived from bundle ID so it
+    // survives app reinstall on the same device and requires no Keychain access at crash time.
+    // Mirrors Android's fallback: SHA-256("ceburu.crash.v1:{packageName}").
+    nonisolated static func crashKey() -> SymmetricKey {
+        let seed = "ceburu.crash.v1:\(Bundle.main.bundleIdentifier ?? "unknown")"
+        return SymmetricKey(data: SHA256.hash(data: Data(seed.utf8)))
     }
 
     /// Imports crash records persisted by `NSSetUncaughtExceptionHandler` during a previous session.
     ///
     /// Called once in ``CeburuAnalyticsSDK/initialize(config:)`` before the flush loop starts.
-    /// Each `.json` file is decoded, converted to a `fatal`-severity `Event`, enqueued for
+    /// Each `.enc` file is decrypted (AES-256-GCM), decoded, converted to a `fatal`-severity `Event`, enqueued for
     /// delivery, and then deleted. Files that cannot be parsed are silently skipped and left
     /// for the next launch.
     ///
@@ -250,9 +273,11 @@ actor EncryptedStore {
             at: crashDir, includingPropertiesForKeys: nil
         )) ?? []
 
-        for file in files where file.pathExtension == "json" {
+        for file in files where file.pathExtension == "enc" {
             do {
-                let data = try Data(contentsOf: file)
+                let encrypted = try Data(contentsOf: file)
+                let sealed    = try AES.GCM.SealedBox(combined: encrypted)
+                let data      = try AES.GCM.open(sealed, using: EncryptedStore.crashKey())
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 else { continue }
 
@@ -273,7 +298,9 @@ actor EncryptedStore {
                     type: "crash",
                     message: "Unhandled iOS exception",
                     sessionId: sessionId,
-                    attributes: attributes
+                    attributes: attributes,
+                    traceId: nil,
+                    spanId: nil
                 )
 
                 try enqueue(event)
@@ -352,8 +379,14 @@ actor EncryptedStore {
     ///
     /// - Parameter sessionId: The current session ID — used as the delivery session for imported crashes.
     func importSignalCrashRecords(sessionId: String) async throws {
-        let breadcrumbsFile = crashDir.appendingPathComponent("breadcrumbs.txt")
-        let savedBreadcrumbs = (try? String(contentsOf: breadcrumbsFile, encoding: .utf8)) ?? ""
+        let breadcrumbsFile = crashDir.appendingPathComponent("breadcrumbs.enc")
+        let savedBreadcrumbs: String = {
+            guard let encrypted = try? Data(contentsOf: breadcrumbsFile),
+                  let sealed    = try? AES.GCM.SealedBox(combined: encrypted),
+                  let plain     = try? AES.GCM.open(sealed, using: EncryptedStore.crashKey())
+            else { return "" }
+            return String(decoding: plain, as: UTF8.self)
+        }()
 
         let files = (try? FileManager.default.contentsOfDirectory(
             at: crashDir, includingPropertiesForKeys: nil
@@ -375,7 +408,9 @@ actor EncryptedStore {
                         type: event.type,
                         message: event.message,
                         sessionId: event.sessionId,
-                        attributes: attrs
+                        attributes: attrs,
+                        traceId: nil,
+                        spanId: nil
                     )
                 }
                 try enqueue(event)
@@ -387,7 +422,7 @@ actor EncryptedStore {
         }
 
         if importedAny {
-            try? FileManager.default.removeItem(at: breadcrumbsFile)
+            try? FileManager.default.removeItem(at: breadcrumbsFile)  // breadcrumbs.enc
         }
     }
 
@@ -398,13 +433,16 @@ actor EncryptedStore {
     /// magic       UInt32   0x4D534947 ("MSIG")
     /// signal      Int32
     /// timestampMs Int64
+    /// aslrSlide   Int64    ASLR slide of main executable at crash time
     /// sessionLen  UInt16   (includes null terminator)
     /// sessionId   [CChar]  (sessionLen bytes, null-terminated)
     /// frameCount  UInt16
     /// frames      [UInt64] (frameCount raw PC addresses)
     /// ```
     ///
-    /// Frame addresses are symbolicated using `dladdr` — safe to call in this normal (non-signal) context.
+    /// Frame addresses are ASLR-adjusted then symbolicated using `dladdr` — safe in normal context.
+    /// The adjustment converts saved crash-time PCs to the equivalent addresses in the current launch,
+    /// so `dladdr` can resolve symbol names despite ASLR relocating the binary on each launch.
     ///
     /// - Parameters:
     ///   - data:              Raw file contents.
@@ -423,6 +461,8 @@ actor EncryptedStore {
         guard let magic: UInt32 = read(UInt32.self), magic == 0x4D534947 else { return nil }
         guard let sig: Int32    = read(Int32.self)                        else { return nil }
         guard let tsMs: Int64   = read(Int64.self)                        else { return nil }
+        // H-2: read saved ASLR slide; older files that predate this field return nil → use 0 (no adjustment).
+        let savedSlide: Int64   = read(Int64.self) ?? 0
         guard let sessionLen: UInt16 = read(UInt16.self)                  else { return nil }
 
         let slen = Int(sessionLen)
@@ -434,19 +474,31 @@ actor EncryptedStore {
 
         guard let frameCount: UInt16 = read(UInt16.self) else { return nil }
 
-        // Symbolicate addresses using dladdr — safe in normal (non-signal) context.
+        // H-2: Compute the slide delta once for all frames.
+        // PC_adjusted = PC_saved - old_slide + new_slide  (modular 64-bit pointer arithmetic).
+        // This makes dladdr() resolve symbols correctly even though ASLR placed the binary at a
+        // different base address in this launch than it was in the launch that crashed.
+        // Resolve _dyld_get_image_vmaddr_slide via dlsym — the symbol is not re-exported
+        // from the Darwin module in Xcode 26+ SDKs but is still present in the dyld library.
+        typealias SlideFunc = @convention(c) (UInt32) -> Int
+        var currentSlide: Int64 = 0
+        if let sym = dlsym(dlopen(nil, RTLD_LAZY), "_dyld_get_image_vmaddr_slide") {
+            currentSlide = Int64(unsafeBitCast(sym, to: SlideFunc.self)(0))
+        }
+
         var stackLines: [String] = []
         for i in 0..<min(Int(frameCount), 32) {
             guard let addr: UInt64 = read(UInt64.self) else { break }
+            let adjustedAddr = addr &- UInt64(bitPattern: savedSlide) &+ UInt64(bitPattern: currentSlide)
             var info = Dl_info()
-            if dladdr(UnsafeRawPointer(bitPattern: UInt(addr)), &info) != 0 {
+            if dladdr(UnsafeRawPointer(bitPattern: UInt(adjustedAddr)), &info) != 0 {
                 let sym = info.dli_sname.map { String(cString: $0) } ?? "<unknown>"
                 let lib = info.dli_fname
                     .map { URL(fileURLWithPath: String(cString: $0)).lastPathComponent } ?? "<unknown>"
-                let off = addr - UInt64(UInt(bitPattern: info.dli_saddr))
+                let off = adjustedAddr - UInt64(UInt(bitPattern: info.dli_saddr))
                 stackLines.append("#\(i)  \(lib)  \(sym) + \(off)")
             } else {
-                stackLines.append("#\(i)  0x\(String(addr, radix: 16))")
+                stackLines.append("#\(i)  0x\(String(adjustedAddr, radix: 16))")
             }
         }
 
@@ -461,7 +513,9 @@ actor EncryptedStore {
                 "exception.type":       signalName(sig),
                 "exception.message":    signalDescription(sig),
                 "exception.stacktrace": stackLines.joined(separator: "\n")
-            ]
+            ],
+            traceId: nil,
+            spanId: nil
         )
     }
 
@@ -472,6 +526,7 @@ actor EncryptedStore {
         case SIGBUS:  return "SIGBUS"
         case SIGILL:  return "SIGILL"
         case SIGFPE:  return "SIGFPE"
+        case SIGTRAP: return "SIGTRAP"
         default:      return "SIG\(sig)"
         }
     }
@@ -483,6 +538,7 @@ actor EncryptedStore {
         case SIGBUS:  return "Bus error — misaligned memory access"
         case SIGILL:  return "Illegal instruction"
         case SIGFPE:  return "Arithmetic exception — division by zero"
+        case SIGTRAP: return "Trap — force-unwrap nil, out-of-range index, or explicit __builtin_trap()"
         default:      return "Signal \(sig) received"
         }
     }
@@ -506,20 +562,29 @@ enum KeyStore {
     /// - Returns: The 256-bit `SymmetricKey` for AES-GCM encryption/decryption.
     /// - Throws: `NSError(domain: "Ceburu.Keychain", ...)` if the Keychain operation fails.
     static func loadOrCreate() throws -> SymmetricKey {
-        if let existing = try load() {
-            return SymmetricKey(data: existing)
-        }
+        // Try Keychain first; fall back to a deterministic key when Keychain is
+        // unavailable (e.g. unsigned simulator builds, errSecMissingEntitlement).
+        do {
+            if let existing = try load() {
+                return SymmetricKey(data: existing)
+            }
 
-        var data = Data(count: 32)
-        let status = data.withUnsafeMutableBytes {
-            SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!)
-        }
-        guard status == errSecSuccess else {
-            throw NSError(domain: "Ceburu.Keychain", code: Int(status))
-        }
+            var data = Data(count: 32)
+            let status = data.withUnsafeMutableBytes {
+                SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!)
+            }
+            guard status == errSecSuccess else {
+                throw NSError(domain: "Ceburu.Keychain", code: Int(status))
+            }
 
-        try save(data)
-        return SymmetricKey(data: data)
+            try save(data)
+            return SymmetricKey(data: data)
+        } catch {
+            // Keychain unavailable — derive a stable key from the bundle id so
+            // the queue can still be encrypted without crashing the SDK.
+            let seed = "ceburu.queue.fallback.v1:\(Bundle.main.bundleIdentifier ?? "unknown")"
+            return SymmetricKey(data: SHA256.hash(data: Data(seed.utf8)))
+        }
     }
 
     /// Attempts to load the key from the Keychain. Returns `nil` if not found.

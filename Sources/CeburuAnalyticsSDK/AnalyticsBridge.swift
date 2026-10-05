@@ -1,36 +1,40 @@
 import Foundation
-import GRPC
-import NIO
-import NIOHPACK
 import OpenTelemetryApi
 import OpenTelemetrySdk
-import OpenTelemetryProtocolExporterGrpc
+import OpenTelemetryProtocolExporterHttp
 import OpenTelemetryProtocolExporterCommon
 
 /// Internal OpenTelemetry bridge — owns the SDK's private Analytics instance.
 ///
-/// Manages three signal pipelines over a single gRPC connection:
-/// - **Logs**: `LogsService/Export` — emitted per-event via `BatchLogRecordProcessor` (~2 s).
-/// - **Metrics**: `MetricsService/Export` — polled every 60 s by `PeriodicMetricReaderSdk`.
-/// - **Traces**: `TraceService/Export` — exported within ~5 s of `span.end()`.
+/// Manages three signal pipelines over OTLP/HTTP (URLSession):
+/// - **Logs**: `POST /apm/v1/logs` — durable path via ``emitBatch(_:)`` from the flush loop.
+/// - **Metrics**: `POST /apm/v1/metrics` — polled every 60 s by `PeriodicMetricReaderSdk`.
+/// - **Traces**: `POST /apm/v1/traces` — exported within ~5 s of `span.end()`.
 ///
-/// All three pipelines share the same `Resource` (tenant, user, service metadata)
+/// All three pipelines share the same `Resource` (tenant, config, device metadata)
 /// so cross-signal correlation works in the backend.
 ///
-/// > Note: The Bearer token is baked into `OtlpConfiguration` at connection time. To rotate,
-/// > call ``updateToken(_:)`` — it is stored and applied on the next connection.
+/// > Token rotation: call ``updateToken(_:)`` — it rebuilds all three exporters so the
+/// > next export request uses the new Bearer token immediately.
 actor AnalyticsBridge {
 
     private var logger: OpenTelemetryApi.Logger?
     private var logProcessor: BatchLogRecordProcessor?
+    private var logExporter: OtlpHttpLogExporter?      // stored for direct batch export (B-2 fix)
     private var tracer: OpenTelemetryApi.Tracer?
     private var meterSdk: MeterSdk?
     private var metricReader: PeriodicMetricReaderSdk?
-    private var group: MultiThreadedEventLoopGroup?
-    private var connection: ClientConnection?
+    private var spanProcessor: BatchSpanProcessor?     // stored so shutdown() can flush it (H-2 fix)
 
     // Current auth token — rebuilt into fresh OtlpConfiguration on updateToken().
     private var currentToken: String
+
+    // Stored so pipelines can be rebuilt on token rotation.
+    private let resource: Resource
+    private let logsEndpoint: URL
+    private let tracesEndpoint: URL
+    private let metricsEndpoint: URL
+    private let metricsExportInterval: TimeInterval
 
     // App-level metric instruments — created lazily on first use, keyed by name.
     private var appCounters:       [String: LongCounterSdk]          = [:]
@@ -46,40 +50,49 @@ actor AnalyticsBridge {
     private var sdkExportSuccessCounter: LongCounterSdk?
     private var sdkExportFailureCounter: LongCounterSdk?
 
-    /// Builds the three OpenTelemetry signal pipelines and registers them with the global
-    /// `OpenTelemetry` instance.
+    /// Builds the three OpenTelemetry signal pipelines over OTLP/HTTP.
     ///
     /// - Parameters:
-    ///   - config:      SDK configuration. `collectorHost`/`collectorPort` determine the gRPC target.
-    ///                  `authToken` is embedded as the `authorization` gRPC metadata header via `OtlpConfiguration`.
-    ///   - deviceModel: Device model string resolved by the caller (e.g. `UIDevice.current.model`).
-    ///                  Passed in because `UIDevice` requires the main actor and `init` is synchronous.
+    ///   - config:      SDK configuration. `collectorHost`/`collectorPort` and `useHTTPS`
+    ///                  determine the OTLP endpoint URLs. `authToken` is sent as the
+    ///                  `authorization: Bearer …` HTTP header on every export request.
+    ///   - deviceModel: Device model string resolved by the caller (e.g. via `sysctlbyname`).
     ///   - osName:      Human-readable OS name (`"iOS"`, `"macOS"`).
-    ///   - osVersion:   OS version string (`UIDevice.current.systemVersion` or `ProcessInfo` equivalent).
-    /// - Throws: If NIO event-loop group or gRPC channel cannot be created.
+    ///   - osVersion:   OS version string.
+    /// - Throws: If the OTLP endpoint URL cannot be constructed.
     init(config: CeburuAnalyticsSDK.Config,
          deviceModel: String,
          osName: String,
          osVersion: String) throws {
-        self.currentToken = config.authToken
 
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        let connection = ClientConnection.insecure(group: group)
-            .connect(host: config.collectorHost, port: config.collectorPort)
+        self.currentToken          = config.authToken
+        self.metricsExportInterval = config.metricsExportInterval
 
-        let resource = Resource(attributes: [
+        let scheme = config.useHTTPS ? "https" : "http"
+        let base   = "\(scheme)://\(config.collectorHost):\(config.collectorPort)"
+
+        guard
+            let logsURL    = URL(string: "\(base)/apm/v1/logs"),
+            let tracesURL  = URL(string: "\(base)/apm/v1/traces"),
+            let metricsURL = URL(string: "\(base)/apm/v1/metrics")
+        else {
+            throw NSError(domain: "CeburuAnalyticsSDK", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid collectorHost: \(config.collectorHost)"])
+        }
+
+        self.logsEndpoint    = logsURL
+        self.tracesEndpoint  = tracesURL
+        self.metricsEndpoint = metricsURL
+
+        self.resource = Resource(attributes: [
             "service.name":                   AttributeValue.string(config.serviceName),
             "service.version":                AttributeValue.string(config.serviceVersion),
             "deployment.environment.name":    AttributeValue.string(config.environment),
             "tenant.id":                      AttributeValue.string(config.tenantId),
             "application.id":                 AttributeValue.string(config.applicationId),
+            "config_id":                      AttributeValue.string(config.configId),
             "enduser.id":                     AttributeValue.string(config.userId),
-            // Unique per SDK init — lets the backend distinguish individual device
-            // instances that share the same service.name and service.version.
             "service.instance.id":            AttributeValue.string(UUID().uuidString),
-            // Device and OS — resource-level so every span and metric carries them,
-            // not just the first log event. Resolved by CeburuAnalyticsSDK.initialize()
-            // before this init is called (UIDevice requires the main actor).
             "device.manufacturer":            AttributeValue.string("Apple"),
             "device.model.name":              AttributeValue.string(deviceModel),
             "os.type":                        AttributeValue.string("darwin"),
@@ -87,43 +100,88 @@ actor AnalyticsBridge {
             "os.version":                     AttributeValue.string(osVersion),
             "telemetry.sdk.name":             AttributeValue.string(CeburuAnalyticsSDK.sdkName),
             "telemetry.sdk.version":          AttributeValue.string(CeburuAnalyticsSDK.sdkVersion),
-            "telemetry.sdk.language":         AttributeValue.string("swift") // fixed — always a Swift/Apple SDK
+            "telemetry.sdk.language":         AttributeValue.string("swift")
         ])
 
-        let otlpHeaders: [(String, String)]? = config.authToken.isEmpty
+        // Build pipelines using the static factory so the call is legal from an
+        // actor init (which is non-isolated in Swift 6 — instance methods cannot
+        // be called here, but static functions are always accessible).
+        let p = Self.makePipelines(
+            token:                 config.authToken,
+            resource:              resource,
+            logsEndpoint:          logsEndpoint,
+            tracesEndpoint:        tracesEndpoint,
+            metricsEndpoint:       metricsEndpoint,
+            metricsExportInterval: metricsExportInterval
+        )
+        logExporter             = p.logExporter
+        logProcessor            = p.logProcessor
+        logger                  = p.logger
+        metricReader            = p.metricReader
+        meterSdk                = p.meterSdk
+        sdkEventsEmittedCounter = p.sdkEventsEmittedCounter
+        sdkEventsDroppedCounter = p.sdkEventsDroppedCounter
+        sdkExportSuccessCounter = p.sdkExportSuccessCounter
+        sdkExportFailureCounter = p.sdkExportFailureCounter
+        spanProcessor           = p.spanProcessor
+        tracer                  = p.tracer
+    }
+
+    // ── Pipeline construction ──────────────────────────────────────────────────
+
+    // All pipeline objects bundled for pass-by-value between the static factory
+    // and the actor's stored properties.
+    private struct PipelineSet {
+        let logExporter:            OtlpHttpLogExporter
+        let logProcessor:           BatchLogRecordProcessor
+        let logger:                 OpenTelemetryApi.Logger
+        let metricReader:           PeriodicMetricReaderSdk
+        let meterSdk:               MeterSdk
+        let sdkEventsEmittedCounter: LongCounterSdk
+        let sdkEventsDroppedCounter: LongCounterSdk
+        let sdkExportSuccessCounter: LongCounterSdk
+        let sdkExportFailureCounter: LongCounterSdk
+        let spanProcessor:          BatchSpanProcessor
+        let tracer:                 OpenTelemetryApi.Tracer
+    }
+
+    /// Creates all three signal pipelines and registers their providers with the
+    /// global `OpenTelemetry` instance. Static so it is callable from `init` without
+    /// actor isolation, and from the isolated `buildPipelines` instance method.
+    private static func makePipelines(
+        token:                 String,
+        resource:              Resource,
+        logsEndpoint:          URL,
+        tracesEndpoint:        URL,
+        metricsEndpoint:       URL,
+        metricsExportInterval: TimeInterval
+    ) -> PipelineSet {
+        let otlpHeaders: [(String, String)]? = token.isEmpty
             ? nil
-            : [("authorization", "Bearer \(config.authToken)")]
+            : [("authorization", "Bearer \(token)")]
         let otlpConfig = OtlpConfiguration(headers: otlpHeaders)
 
         // ── Logs pipeline ──────────────────────────────────────────────────────
-        let logExporter  = OtlpLogExporter(channel: connection, config: otlpConfig)
-        let logProcessor = BatchLogRecordProcessor(logRecordExporter: logExporter)
+        let logExp  = OtlpHttpLogExporter(endpoint: logsEndpoint, config: otlpConfig)
+        let logProc = BatchLogRecordProcessor(logRecordExporter: logExp)
 
         let loggerProvider = LoggerProviderBuilder()
-            .with(processors: [logProcessor])
+            .with(processors: [logProc])
             .with(resource: resource)
             .build()
         OpenTelemetry.registerLoggerProvider(loggerProvider: loggerProvider)
 
-        self.logProcessor = logProcessor
-        // Instrumentation scope identifies which SDK library produced each signal.
-        // Uses sdkName/sdkVersion constants so the scope stays in sync with the
-        // published artifact version without requiring manual updates here.
-        self.logger = OpenTelemetry.instance.loggerProvider
+        let loggerInst = OpenTelemetry.instance.loggerProvider
             .loggerBuilder(instrumentationScopeName: CeburuAnalyticsSDK.sdkName)
             .setInstrumentationVersion(CeburuAnalyticsSDK.sdkVersion)
             .build()
 
         // ── Metrics pipeline ───────────────────────────────────────────────────
-        let metricExporter = OtlpMetricExporter(channel: connection, config: otlpConfig)
-        let metricReader   = PeriodicMetricReaderBuilder(exporter: metricExporter)
-            .setInterval(timeInterval: config.metricsExportInterval)
+        let metricExp    = OtlpHttpMetricExporter(endpoint: metricsEndpoint, config: otlpConfig)
+        let metricReader = PeriodicMetricReaderBuilder(exporter: metricExp)
+            .setInterval(timeInterval: metricsExportInterval)
             .build()
-        self.metricReader = metricReader
 
-        // ViewRegistry.findViews() only searches user-registered views; without at least one
-        // view, every instrument gets zero storages and all metric calls silently no-op.
-        // The catch-all view (name: ".*", DefaultAggregation) restores the expected defaults.
         let meterProvider: MeterProviderSdk = MeterProviderSdk.builder()
             .registerMetricReader(reader: metricReader)
             .setResource(resource: resource)
@@ -133,41 +191,70 @@ actor AnalyticsBridge {
             )
             .build()
         OpenTelemetry.registerMeterProvider(meterProvider: meterProvider)
-        self.meterSdk = meterProvider.get(name: CeburuAnalyticsSDK.sdkName)
 
-        let sdkMeter = meterProvider.get(name: "\(CeburuAnalyticsSDK.sdkName).internal")
-        self.sdkEventsEmittedCounter = sdkMeter.counterBuilder(name: "mobile.sdk.events.emitted")
-            .setUnit("{event}").build()
-        self.sdkEventsDroppedCounter = sdkMeter.counterBuilder(name: "mobile.sdk.events.dropped")
-            .setUnit("{event}").build()
-        self.sdkExportSuccessCounter = sdkMeter.counterBuilder(name: "mobile.sdk.export.success")
-            .setUnit("{batch}").build()
-        self.sdkExportFailureCounter = sdkMeter.counterBuilder(name: "mobile.sdk.export.failure")
-            .setUnit("{batch}").build()
+        let meterSdkInst = meterProvider.get(name: CeburuAnalyticsSDK.sdkName)
+        let sdkMeter     = meterProvider.get(name: "\(CeburuAnalyticsSDK.sdkName).internal")
 
         // ── Traces pipeline ────────────────────────────────────────────────────
-        let spanExporter  = OtlpTraceExporter(channel: connection, config: otlpConfig)
-        let spanProcessor = BatchSpanProcessor(spanExporter: spanExporter)
+        let spanExp  = OtlpHttpTraceExporter(endpoint: tracesEndpoint, config: otlpConfig)
+        let spanProc = BatchSpanProcessor(spanExporter: spanExp)
 
         let tracerProvider = TracerProviderBuilder()
-            .add(spanProcessor: spanProcessor)
+            .add(spanProcessor: spanProc)
             .with(resource: resource)
             .build()
         OpenTelemetry.registerTracerProvider(tracerProvider: tracerProvider)
 
-        self.tracer = OpenTelemetry.instance.tracerProvider.get(
+        let tracerInst = OpenTelemetry.instance.tracerProvider.get(
             instrumentationName:    CeburuAnalyticsSDK.sdkName,
             instrumentationVersion: CeburuAnalyticsSDK.sdkVersion
         )
 
-        self.group      = group
-        self.connection = connection
+        return PipelineSet(
+            logExporter:            logExp,
+            logProcessor:           logProc,
+            logger:                 loggerInst,
+            metricReader:           metricReader,
+            meterSdk:               meterSdkInst,
+            sdkEventsEmittedCounter: sdkMeter.counterBuilder(name: "mobile.sdk.events.emitted")
+                                        .setUnit("{event}").build(),
+            sdkEventsDroppedCounter: sdkMeter.counterBuilder(name: "mobile.sdk.events.dropped")
+                                        .setUnit("{event}").build(),
+            sdkExportSuccessCounter: sdkMeter.counterBuilder(name: "mobile.sdk.export.success")
+                                        .setUnit("{batch}").build(),
+            sdkExportFailureCounter: sdkMeter.counterBuilder(name: "mobile.sdk.export.failure")
+                                        .setUnit("{batch}").build(),
+            spanProcessor:          spanProc,
+            tracer:                 tracerInst
+        )
+    }
+
+    /// Rebuilds all three pipelines with a new token. Called only from ``updateToken(_:)``.
+    private func buildPipelines(token: String) {
+        let p = Self.makePipelines(
+            token:                 token,
+            resource:              resource,
+            logsEndpoint:          logsEndpoint,
+            tracesEndpoint:        tracesEndpoint,
+            metricsEndpoint:       metricsEndpoint,
+            metricsExportInterval: metricsExportInterval
+        )
+        logExporter             = p.logExporter
+        logProcessor            = p.logProcessor
+        logger                  = p.logger
+        metricReader            = p.metricReader
+        meterSdk                = p.meterSdk
+        sdkEventsEmittedCounter = p.sdkEventsEmittedCounter
+        sdkEventsDroppedCounter = p.sdkEventsDroppedCounter
+        sdkExportSuccessCounter = p.sdkExportSuccessCounter
+        sdkExportFailureCounter = p.sdkExportFailureCounter
+        spanProcessor           = p.spanProcessor
+        tracer                  = p.tracer
     }
 
     // ── Metric flush ───────────────────────────────────────────────────────────
 
     /// Forces an immediate metric collection and export cycle.
-    /// - Returns: `true` if the export succeeded (or there was nothing to export), `false` if the gRPC call failed.
     func flushMetrics() -> Bool {
         guard let metricReader else { return false }
         switch metricReader.forceFlush() {
@@ -194,27 +281,99 @@ actor AnalyticsBridge {
 
     // ── Token rotation ─────────────────────────────────────────────────────────
 
-    /// Stores a replacement Bearer token.
+    /// Replaces the Bearer token and immediately rebuilds all three export pipelines.
     ///
-    /// The token is applied to `OtlpConfiguration` on the next gRPC connection — not mid-stream.
-    /// This is a known limitation: iOS gRPC bakes auth into the exporter config at connection time,
-    /// so rotation only takes effect when the current connection is recycled.
+    /// Unlike the previous implementation (which stored the token but never used it),
+    /// this flushes any in-flight data from the old exporters before rebuilding, so
+    /// no events are lost during rotation. The very next export request from each
+    /// pipeline uses the new token.
     ///
     /// - Parameter token: The new Bearer token. Empty string removes the auth header.
-    func updateToken(_ token: String) {
+    func updateToken(_ token: String) throws {
+        guard token != currentToken else { return }
+        teardownPipelines()
         currentToken = token
+        buildPipelines(token: token)
     }
 
-    // ── Log emit ───────────────────────────────────────────────────────────────
+    // ── Batch log emit (durable flush path) ────────────────────────────────────
 
-    /// Emits a single event to the OpenTelemetry logger and returns whether it was accepted.
+    /// Exports a batch of events directly to the OTLP/HTTP log endpoint and returns
+    /// whether delivery was confirmed by an HTTP 2xx response.
     ///
-    /// Translates the SDK's internal `Event` model into an OTLP log record. The record is
-    /// handed to the `BatchLogRecordProcessor`, which buffers it and exports to the collector
-    /// within ~2 seconds.
+    /// This is the durable-queue flush path. Calling code (``CeburuAnalyticsSDK/flushPersisted()``)
+    /// must only call ``EncryptedStore/acknowledge(_:)`` (delete the on-disk files) after
+    /// this returns `true` — ensuring events are never lost if the process dies between
+    /// writing and exporting.
     ///
-    /// - Parameter event: The event to emit. All attributes are forwarded verbatim.
-    /// - Returns: `true` if the logger was available and the record was submitted; `false` if the bridge is not initialized.
+    /// - Parameter events: Events decoded from the on-disk queue.
+    /// - Returns: `true` if the collector returned HTTP 2xx; `false` on network error or non-2xx.
+    func emitBatch(_ events: [CeburuAnalyticsSDK.Event]) -> Bool {
+        guard let logExporter else { return false }
+
+        let scope = InstrumentationScopeInfo(name: CeburuAnalyticsSDK.sdkName,
+                                             version: CeburuAnalyticsSDK.sdkVersion)
+
+        // Build ReadableLogRecord values directly — ReadableLogRecord is a concrete struct
+        // in opentelemetry-swift-core 2.x, not a protocol.
+        let records: [ReadableLogRecord] = events.map { event in
+            var attrs: [String: AttributeValue] = [
+                "event.id":             .string(event.eventId),
+                "session.id":           .string(event.sessionId),
+                "telemetry.event.type": .string(event.type)
+            ]
+            for (key, value) in event.attributes {
+                attrs[key] = .string(value)
+            }
+
+            // Reconstruct the SpanContext that was active when this event was captured.
+            // traceId/spanId are stored on the Event at enqueue time (from the OTel context
+            // provider); they survive serialisation to disk so flushed-on-next-launch events
+            // still carry the correct trace_id and span_id in the OTLP payload.
+            var spanCtx: SpanContext? = nil
+            if let traceHex = event.traceId, let spanHex = event.spanId {
+                let traceId = TraceId(fromHexString: traceHex)
+                let spanId  = SpanId(fromHexString: spanHex)
+                if traceId.isValid && spanId.isValid {
+                    spanCtx = SpanContext.createFromRemoteParent(
+                        traceId:    traceId,
+                        spanId:     spanId,
+                        traceFlags: TraceFlags(fromByte: 0x01),   // sampled
+                        traceState: TraceState()
+                    )
+                }
+            }
+
+            return ReadableLogRecord(
+                resource:                 resource,
+                instrumentationScopeInfo: scope,
+                timestamp:                Date(timeIntervalSince1970: Double(event.timestampUnixMs) / 1000),
+                observedTimestamp:        Date(),
+                spanContext:              spanCtx,
+                severity:                 mapSeverity(event.severity),
+                body:                     .string(event.message),
+                attributes:               attrs
+            )
+        }
+
+        // export() queues records but always returns .success immediately (fire-and-forget).
+        // forceFlush() sends the queued batch synchronously (blocks on a DispatchSemaphore)
+        // and returns the actual HTTP result — .success only on HTTP 2xx.
+        _ = logExporter.export(logRecords: records)
+        switch logExporter.forceFlush(explicitTimeout: 30) {
+        case .success: return true
+        case .failure: return false
+        }
+    }
+
+    // ── Real-time log emit (logger adapter path) ────────────────────────────────
+
+    /// Emits a single event through the OTel logger pipeline (BatchLogRecordProcessor).
+    ///
+    /// Used by logger adapters (``OSLogAdapter``, ``CallbackLoggerAdapter``) for real-time
+    /// events that don't go through the disk queue. These are best-effort — if the process
+    /// dies before the batch processor exports them, they are lost (adapter traffic is
+    /// supplemental; the SDK's own durable path uses ``emitBatch(_:)``).
     func emit(_ event: CeburuAnalyticsSDK.Event) -> Bool {
         guard let logger else { return false }
 
@@ -230,6 +389,7 @@ actor AnalyticsBridge {
         logger.logRecordBuilder()
             .setSeverity(mapSeverity(event.severity))
             .setBody(.string(event.message))
+            .setTimestamp(Date(timeIntervalSince1970: Double(event.timestampUnixMs) / 1000))
             .setAttributes(attributes)
             .emit()
 
@@ -238,90 +398,37 @@ actor AnalyticsBridge {
 
     // ── App-level metrics ──────────────────────────────────────────────────────
 
-    /// Increments a named counter by `value`.
-    ///
-    /// The counter instrument is created lazily on first call and reused on subsequent calls
-    /// with the same `name`. All data points for this instrument share the same metric series;
-    /// `attrs` differentiate individual data points within it.
-    ///
-    /// - Parameters:
-    ///   - name:  Instrument name (e.g. `"checkout.attempts"`).
-    ///   - value: Amount to add (must be ≥ 0 for counters).
-    ///   - attrs: Attributes attached to this individual data point.
     func incrementCounter(name: String, value: Int64, attrs: [String: String], unit: String = "") {
         guard let meterSdk else { return }
-        let counter = appCounters[name] ?? {
-            let builder = meterSdk.counterBuilder(name: name)
-            if !unit.isEmpty { builder.setUnit(unit) }
-            let c = builder.build()
-            appCounters[name] = c
-            return c
-        }()
-        counter.add(value: Int(value), attributes: attrs.mapValues { .string($0) })
+        if appCounters[name] == nil {
+            let b = meterSdk.counterBuilder(name: name)
+            appCounters[name] = !unit.isEmpty ? b.setUnit(unit).build() : b.build()
+        }
+        appCounters[name]?.add(value: Int(value), attributes: attrs.mapValues { .string($0) })
     }
 
-    /// Increments (or decrements) a named up-down counter by `value`.
-    ///
-    /// The instrument is created lazily on first call. Unlike regular counters,
-    /// up-down counters accept negative deltas — use them for values that can go both ways
-    /// (active sessions, queue depth, item counts).
-    ///
-    /// - Parameters:
-    ///   - name:  Instrument name (e.g. `"active.downloads"`).
-    ///   - value: Delta — positive to add, negative to subtract.
-    ///   - attrs: Attributes attached to this individual data point.
     func incrementUpDownCounter(name: String, value: Int64, attrs: [String: String], unit: String = "") {
         guard let meterSdk else { return }
-        let counter = appUpDownCounters[name] ?? {
-            let builder = meterSdk.upDownCounterBuilder(name: name)
-            if !unit.isEmpty { builder.setUnit(unit) }
-            let c = builder.build()
-            appUpDownCounters[name] = c
-            return c
-        }()
-        counter.add(value: Int(value), attributes: attrs.mapValues { .string($0) })
+        if appUpDownCounters[name] == nil {
+            let b = meterSdk.upDownCounterBuilder(name: name)
+            appUpDownCounters[name] = !unit.isEmpty ? b.setUnit(unit).build() : b.build()
+        }
+        appUpDownCounters[name]?.add(value: Int(value), attributes: attrs.mapValues { .string($0) })
     }
 
-    /// Records a measurement into a named histogram.
-    ///
-    /// The histogram instrument is created lazily on first call. Histograms aggregate
-    /// measurements into bucket counts, sum, and count — useful for latency distributions
-    /// and size distributions.
-    ///
-    /// - Parameters:
-    ///   - name:  Instrument name (e.g. `"api.response.ms"`).
-    ///   - value: Measured value (must be ≥ 0).
-    ///   - attrs: Attributes attached to this individual data point.
     func recordHistogram(name: String, value: Double, attrs: [String: String], unit: String = "") {
         guard let meterSdk else { return }
-        let histogram = appHistograms[name] ?? {
-            let builder = meterSdk.histogramBuilder(name: name)
-            if !unit.isEmpty { builder.setUnit(unit) }
-            let h = builder.build()
-            appHistograms[name] = h
-            return h
-        }()
-        histogram.record(value: value, attributes: attrs.mapValues { .string($0) })
+        if appHistograms[name] == nil {
+            let b = meterSdk.histogramBuilder(name: name)
+            appHistograms[name] = !unit.isEmpty ? b.setUnit(unit).build() : b.build()
+        }
+        appHistograms[name]?.record(value: value, attributes: attrs.mapValues { .string($0) })
     }
 
-    /// Registers a callback that is polled every 60 s and reported as a cumulative counter.
-    ///
-    /// The returned `ObservableInstrumentSdk` is retained by `observableInstruments` to prevent
-    /// premature deallocation. All retained instruments are closed on ``shutdown()``,
-    /// which stops their polling callbacks.
-    ///
-    /// - Parameters:
-    ///   - name:     Instrument name (e.g. `"app.sessions.total"`).
-    ///   - callback: Returns the current cumulative count. Must be cheap and non-blocking —
-    ///               it runs on the metrics export thread.
     func observeCounter(name: String, callback: @Sendable @escaping () -> Int64, unit: String = "") {
         guard let meterSdk else { return }
-        // ObservableMeasurementSdk.record(value:Int) always converts to Double, so
-        // LongSumAggregator.toPoint() would read longValue=0. Using .ofDoubles() selects
-        // DoubleSumAggregator which correctly reads doubleValue.
-        let cBuilder = meterSdk.counterBuilder(name: name)
-        if !unit.isEmpty { cBuilder.setUnit(unit) }
-        let instrument = cBuilder
+        let b = meterSdk.counterBuilder(name: name)
+        let instrument = (!unit.isEmpty ? b.setUnit(unit) : b)
             .ofDoubles()
             .buildWithCallback { measurement in
                 measurement.record(value: Double(callback()), attributes: [:])
@@ -329,20 +436,10 @@ actor AnalyticsBridge {
         observableInstruments.append(instrument)
     }
 
-    /// Registers a callback that is polled every 60 s and reported as a gauge (point-in-time value).
-    ///
-    /// The returned `ObservableInstrumentSdk` is retained by `observableInstruments`.
-    /// Use for system state sampled on demand: memory usage, battery level, thread count.
-    ///
-    /// - Parameters:
-    ///   - name:     Instrument name (e.g. `"memory.used.mb"`).
-    ///   - callback: Returns the current value. Must be cheap and non-blocking —
-    ///               it runs on the metrics export thread.
     func observeGauge(name: String, callback: @Sendable @escaping () -> Double, unit: String = "") {
         guard let meterSdk else { return }
-        let gBuilder = meterSdk.gaugeBuilder(name: name)
-        if !unit.isEmpty { gBuilder.setUnit(unit) }
-        let instrument = gBuilder
+        let b = meterSdk.gaugeBuilder(name: name)
+        let instrument = (!unit.isEmpty ? b.setUnit(unit) : b)
             .buildWithCallback { measurement in
                 measurement.record(value: callback(), attributes: [:])
             }
@@ -351,17 +448,6 @@ actor AnalyticsBridge {
 
     // ── App-level traces ───────────────────────────────────────────────────────
 
-    /// Starts a named span for an app-level operation.
-    ///
-    /// The caller is responsible for calling `span.end()` or `span.recordException()` + `end()`
-    /// when the operation finishes. Initial `attrs` are set as span attributes at start time.
-    /// `kind` defaults to `internal` — use `client` for outgoing calls, `server` for incoming.
-    ///
-    /// - Parameters:
-    ///   - name:  Span name (e.g. `"payment.flow"`, `"outgoing.http.call"`).
-    ///   - attrs: Initial span attributes applied at start time.
-    ///   - kind:  `SpanKind` — controls how backends render the span in trace waterfalls.
-    /// - Returns: An `AppSpan` wrapping the started span, or an inert `AppSpan(span: nil)` if unavailable.
     func startAppSpan(
         name:  String,
         attrs: [String: String],
@@ -370,37 +456,48 @@ actor AnalyticsBridge {
         guard let tracer else { return CeburuAnalyticsSDK.AppSpan(span: nil) }
         let builder = tracer.spanBuilder(spanName: name).setSpanKind(spanKind: kind)
         attrs.forEach { k, v in _ = builder.setAttribute(key: k, value: AttributeValue.string(v)) }
-        return CeburuAnalyticsSDK.AppSpan(span: builder.startSpan())
+        let span = builder.startSpan()
+        OpenTelemetry.instance.contextProvider.setActiveSpan(span)
+        return CeburuAnalyticsSDK.AppSpan(span: span)
     }
 
     // ── Shutdown ───────────────────────────────────────────────────────────────
 
-    /// Releases all observable instrument callbacks, flushes the log processor,
-    /// and closes the gRPC connection and NIO event-loop group.
-    ///
-    /// After this call, all pipeline references are `nil` and the actor is inert.
-    /// `CeburuAnalyticsSDK.shutdown()` calls this as the last step of its teardown.
+    /// Flushes all three signal pipelines, closes observable instruments, and
+    /// releases all pipeline references.
     func shutdown() {
+        teardownPipelines()
+    }
+
+    // ── Private helpers ────────────────────────────────────────────────────────
+
+    /// Flushes and shuts down all three pipelines. Safe to call before a rebuild.
+    private func teardownPipelines() {
         observableInstruments.forEach { $0.close() }
         observableInstruments.removeAll()
-        logProcessor?.forceFlush()
-        logProcessor?.shutdown()
-        try? connection?.close().wait()
-        try? group?.syncShutdownGracefully()
-        logger       = nil
-        logProcessor = nil
-        tracer       = nil
-        meterSdk     = nil
-        metricReader = nil
+
+        _ = logProcessor?.forceFlush()
+        _ = logProcessor?.shutdown()
+
+        _ = spanProcessor?.forceFlush()
+        _ = spanProcessor?.shutdown()
+
+        _ = metricReader?.forceFlush()
+        _ = metricReader?.shutdown()
+
+        logger               = nil
+        logProcessor         = nil
+        logExporter          = nil
+        tracer               = nil
+        spanProcessor        = nil
+        meterSdk             = nil
+        metricReader         = nil
         sdkEventsEmittedCounter = nil
         sdkEventsDroppedCounter = nil
         sdkExportSuccessCounter = nil
         sdkExportFailureCounter = nil
     }
 
-    // ── Severity mapping ───────────────────────────────────────────────────────
-
-    /// Maps the SDK's internal `Severity` enum to the OpenTelemetry API `Severity` type.
     private func mapSeverity(_ severity: CeburuAnalyticsSDK.Severity) -> OpenTelemetryApi.Severity {
         switch severity {
         case .trace: return .trace

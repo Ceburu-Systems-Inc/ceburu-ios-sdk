@@ -1,6 +1,6 @@
 # CeburuAnalyticsSDK — iOS
 
-Enterprise-grade OpenTelemetry logging SDK for iOS. Captures log events from your app, encrypts them on-device, and delivers them to your assigned Ceburu Collector endpoint via gRPC.
+Enterprise-grade OpenTelemetry logging SDK for iOS. Captures log events from your app, encrypts them on-device, and delivers them to your assigned Ceburu Collector endpoint via OTLP/HTTP.
 
 ---
 
@@ -18,7 +18,8 @@ Add the SDK via Swift Package Manager in Xcode:
 
 1. **File → Add Package Dependencies**
 2. Enter the repository URL provided by your account team
-3. Select **CeburuAnalyticsSDK** as the library to add to your target
+3. Select version `3.0.0` (or **Up to Next Major Version** from `3.0.0`)
+4. Select **CeburuAnalyticsSDK** as the library to add to your target
 
 ---
 
@@ -35,18 +36,20 @@ struct MyApp: App {
         Task {
             try? await CeburuAnalyticsSDK.shared.initialize(
                 config: CeburuAnalyticsSDK.Config(
-                    // ── Required ──────────────────────────────────────────
+                    // ── Required ──────────────────────────────────────────────
                     serviceName:    "MyApp",
                     serviceVersion: "x.x.x",
                     environment:    "production",
                     tenantId:       "<your-tenant-id>",        // provided by account team
                     applicationId:  "<your-application-id>",   // provided by account team
+                    configId:       "<your-config-id>",        // provided by account team
+                    collectorHost:  "<your-collector-host>",   // provided by account team
                     userId:         "<user-id>",               // unique per user; update at login/logout
                     authToken:      "<your-customer-token>",   // Bearer token for collector auth
-                    collectorHost:  "<your-collector-host>",   // provided by account team
 
-                    // ── Optional ──────────────────────────────────────────
-                    collectorPort:         4317,     // gRPC port (default: 4317)
+                    // ── Optional ──────────────────────────────────────────────
+                    collectorPort:         4318,     // OTLP/HTTP port (default: 4318)
+                    useHTTPS:              true,     // must be true in production
                     queueMaxBytes:         52428800, // 50 MB on-device queue limit
                     retentionHours:        72,       // hours to retain events if delivery fails
                     maxBatchEvents:        200,      // max events per export batch
@@ -63,7 +66,7 @@ struct MyApp: App {
 }
 ```
 
-> **Note:** `collectorHost`, `tenantId`, and `applicationId` are provided by your account team. Do not hardcode placeholder values in production builds.
+> **Note:** `collectorHost`, `tenantId`, `applicationId`, and `configId` are provided by your account team. Do not hardcode placeholder values in production builds.
 
 ### Config Reference
 
@@ -74,10 +77,12 @@ struct MyApp: App {
 | `environment` | **Required** | — | `"production"`, `"staging"`, etc. |
 | `tenantId` | **Required** | — | Tenant identifier (from account team) |
 | `applicationId` | **Required** | — | Bundle ID (from account team) |
-| `userId` | **Required** | — | Unique per user; update at login/logout with `setUser()` |
-| `authToken` | **Required** | — | Customer-provided Bearer token |
-| `collectorHost` | **Required** | — | gRPC collector host (from account team) |
-| `collectorPort` | Optional | `4317` | gRPC port |
+| `configId` | **Required** | `""` | Ceburu configuration ID — routes signals to the correct tenant index on the edge. Provided by account team. |
+| `collectorHost` | **Required** | — | OTLP/HTTP collector host (from account team) |
+| `userId` | **Required** | `""` | Unique per user; update at login/logout with `setUser()` |
+| `authToken` | **Required** | `""` | Customer-provided Bearer token |
+| `collectorPort` | Optional | `4318` | OTLP/HTTP port |
+| `useHTTPS` | Optional | `true` | Use HTTPS — must be `true` in production |
 | `queueMaxBytes` | Optional | `52428800` (50 MB) | On-device queue size limit |
 | `retentionHours` | Optional | `72` | Hours to retain events if delivery fails |
 | `maxBatchEvents` | Optional | `200` | Max events per export batch |
@@ -88,7 +93,7 @@ struct MyApp: App {
 
 ## Logs
 
-The SDK exports log events within ~2 seconds via gRPC to the collector's logs pipeline.
+The SDK exports log events to `/apm/v1/logs` within ~2 seconds via OTLP/HTTP.
 
 ### Step 1 — Connect your existing logger (one-time setup)
 
@@ -181,7 +186,7 @@ Create a custom destination that forwards to the SDK. Write this once in your pr
 import SwiftyBeaver
 import CeburuAnalyticsSDK
 
-final class MobileSDKDestination: BaseDestination {
+final class CeburuDestination: BaseDestination {
     override func send(
         _ level: SwiftyBeaver.Level,
         msg: String,
@@ -191,8 +196,9 @@ final class MobileSDKDestination: BaseDestination {
         line: Int,
         context: Any? = nil
     ) -> String? {
-        MobileLogSink.logSync(level: level.description, message: msg)
-        return super.send(level, msg: msg, thread: thread, file: file, function: function, line: line, context: context)
+        CallbackLoggerAdapter.shared.forward(level: level.description, message: msg)
+        return super.send(level, msg: msg, thread: thread, file: file,
+                          function: function, line: line, context: context)
     }
 }
 ```
@@ -200,7 +206,7 @@ final class MobileSDKDestination: BaseDestination {
 Register at startup:
 
 ```swift
-SwiftyBeaver.addDestination(MobileSDKDestination())
+SwiftyBeaver.addDestination(CeburuDestination())
 ```
 
 All existing `SwiftyBeaver.warn("...")` calls now also go to the Ceburu Collector.
@@ -215,7 +221,7 @@ Create a custom logger that forwards to the SDK. Write this once in your project
 import CocoaLumberjack
 import CeburuAnalyticsSDK
 
-final class MobileSDKLogger: DDAbstractLogger {
+final class CeburuLumberjackLogger: DDAbstractLogger {
     override func log(message logMessage: DDLogMessage) {
         let level: String
         switch logMessage.flag {
@@ -225,7 +231,7 @@ final class MobileSDKLogger: DDAbstractLogger {
         case .debug:   level = "DEBUG"
         default:       level = "TRACE"
         }
-        MobileLogSink.logSync(level: level, message: logMessage.message)
+        CallbackLoggerAdapter.shared.forward(level: level, message: logMessage.message)
     }
 }
 ```
@@ -233,7 +239,7 @@ final class MobileSDKLogger: DDAbstractLogger {
 Register at startup:
 
 ```swift
-DDLog.add(MobileSDKLogger())
+DDLog.add(CeburuLumberjackLogger())
 ```
 
 ---
@@ -289,7 +295,7 @@ await CeburuAnalyticsSDK.shared.info(
 
 ### PII / Secret Handling
 
-The SDK automatically redacts sensitive data in attributes before sending:
+The SDK automatically redacts sensitive data in attributes before writing to disk or sending to the collector:
 
 | Key pattern | Behaviour |
 |---|---|
@@ -300,19 +306,95 @@ The SDK automatically redacts sensitive data in attributes before sending:
 
 ### Offline Behaviour
 
-Events are encrypted with AES-GCM and stored on-device when the collector is unreachable. On reconnection the SDK flushes the queue automatically using exponential backoff. If the queue reaches its size limit, the lowest-severity events are evicted first to preserve errors and fatals.
+Events are encrypted with AES-256-GCM and stored on-device when the collector is unreachable. On reconnection the SDK flushes the queue automatically using exponential backoff. Events older than `retentionHours` are discarded. If the queue reaches `queueMaxBytes`, the lowest-severity events are evicted first — FATAL and ERROR events survive storage pressure longer than routine INFO/DEBUG events.
 
 ### Crash Reporting
 
-Unhandled exceptions are captured and persisted to disk immediately at crash time. On the next app launch the SDK imports the crash record and delivers it to the collector as a `fatal` severity event with the full stack trace attached.
+Unhandled exceptions (`NSException`) and POSIX signals (SIGABRT, SIGSEGV, SIGILL, SIGBUS, SIGTRAP) are captured and persisted to disk immediately at crash time using AES-256-GCM encryption. On the next app launch the SDK imports the crash record and delivers it to the collector as a `FATAL` severity event with the full stack trace and breadcrumb trail attached.
+
+The crash event in the collector contains:
+
+| Attribute | Value |
+|---|---|
+| `severity` | `FATAL` |
+| `telemetry.event.type` | `crash` |
+| `exception.type` | Signal name (e.g. `SIGABRT`) or exception class |
+| `exception.message` | Human-readable description |
+| `exception.stacktrace` | Full symbolicated stack trace |
+| `crash.session.id` | Session ID from the crashed run |
+| `session.breadcrumbs` | Pipe-separated breadcrumb trail at crash time |
 
 No additional setup is required — crash handling is enabled automatically on `initialize()`.
 
 ---
 
+## Log-Trace Correlation
+
+When a log event is emitted while an active OTel span is in context, the SDK automatically captures the span's `trace_id` and `span_id` and attaches them to the log record. When exported, these IDs link the log to its corresponding trace in the backend.
+
+No additional setup is required. To emit a correlated log:
+
+```swift
+let span = await CeburuAnalyticsSDK.shared.startSpan(
+    "checkout.verified",
+    attrs: ["order.id": "ORD-456"]
+)
+
+// This log is emitted while the span is active.
+// trace_id and span_id are captured and attached automatically.
+await CeburuAnalyticsSDK.shared.info("Payment validated", attributes: ["amount": "49.99"])
+
+span.end()
+```
+
+In the collector, the log record will include:
+
+```
+Attributes:
+    -> trace_id: Str(4bf92f3577b34da6a3ce929d0e0e4736)
+    -> span_id:  Str(00f067aa0ba902b7)
+```
+
+Use these to navigate from a log entry directly to its trace in your observability platform.
+
+---
+
+## User Identity
+
+Each user is identified through the `userId` config field. It appears as `enduser.id` on every telemetry signal (logs, metrics, traces) emitted during that session.
+
+> **Note:** Multiple users share the same `tenantId`. Each must have a distinct `userId` so their events can be distinguished in the collector.
+
+### Setting userId at Initialization
+
+Pass `userId` in the Config at initialization (see [Initialization](#initialization)).
+
+### Updating userId at Runtime
+
+Call `setUser()` on login, account switch, or logout. The new identity is propagated to both log events and trace spans immediately:
+
+```swift
+await CeburuAnalyticsSDK.shared.setUser("user-john-001")  // after login — logs AND spans carry enduser.id
+await CeburuAnalyticsSDK.shared.setUser("")               // on logout — clears enduser.id
+```
+
+### Output — enduser.id in Resource Attributes
+
+All three signals carry `enduser.id` as a resource attribute alongside `tenant.id`:
+
+```
+Resource attributes:
+     -> tenant.id:     Str(tenant-acme)
+     -> config_id:     Str(cfg-prod-001)
+     -> enduser.id:    Str(user-john-001)
+     -> service.name:  Str(MyApp)
+```
+
+---
+
 ## Metrics
 
-App-level metrics are exported every `metricsExportInterval` seconds (default: 60) — a separate signal and endpoint from logs and traces.
+App-level metrics are exported every `metricsExportInterval` seconds (default: 60) to `/apm/v1/metrics` — a separate endpoint from logs and traces.
 
 ### Counter — Monotonically Increasing
 
@@ -341,25 +423,20 @@ await CeburuAnalyticsSDK.shared.recordHistogram(
 )
 ```
 
-### Observable Gauge — Polled Every `metricsExportInterval` s
+### Observable Gauge / Counter — Polled Every `metricsExportInterval` s
 
 Register once at startup; the SDK polls the callback automatically:
 
 ```swift
-await CeburuAnalyticsSDK.shared.observeGauge("memory.used.mb") {
-    Double(ProcessInfo.processInfo.physicalMemory) / 1_048_576.0
+await CeburuAnalyticsSDK.shared.observeGauge(name: "memory.used.mb", unit: "MiBy") {
+    let info = mach_task_basic_info()
+    // ... return resident memory in MB
+    return memoryMB
+}
+await CeburuAnalyticsSDK.shared.observeCounter(name: "app.sessions.total", unit: "{session}") {
+    Int64(sessionCount)
 }
 ```
-
-### Observable Counter — Polled Every `metricsExportInterval` s
-
-Use for cumulative counts that are maintained by your app (e.g. total sessions since launch):
-
-```swift
-await CeburuAnalyticsSDK.shared.observeCounter("app.sessions.total") { sessionCount }
-```
-
-The callback returns `Int64` and is called on the metrics export thread — keep it cheap and non-blocking.
 
 ### Force Flush
 
@@ -376,12 +453,12 @@ let ok = await CeburuAnalyticsSDK.shared.flushMetrics()
 ```
 ResourceMetrics #0
 Resource attributes:
-     -> tenant.id: Str(tenant-acme)    -> user.id: Str(user-john-001)
+     -> tenant.id: Str(tenant-acme)    -> enduser.id: Str(user-john-001)
 Metric #0  Name: checkout.attempts  DataType: Sum  IsMonotonic: true  Value: 3
 Metric #1  Name: active.downloads   DataType: Sum  IsMonotonic: false  Value: 2
 Metric #2  Name: api.response.ms    DataType: Histogram  Count: 5  Sum: 612.0
 Metric #3  Name: memory.used.mb     DataType: Gauge  Value: 271.0
-Metric #4  Name: app.sessions.total DataType: Sum  IsMonotonic: true  Value: 1.0
+Metric #4  Name: app.sessions.total DataType: Sum  IsMonotonic: true  Value: 1
 ```
 
 ### SDK-Internal Health Metrics
@@ -401,7 +478,7 @@ Use `mobile.sdk.events.dropped` and `mobile.sdk.export.failure` to alert on SDK 
 
 ## Distributed Tracing
 
-Traces are exported independently of logs and metrics — a separate gRPC stream sent on span completion.
+Traces are exported to `/apm/v1/traces` within seconds of `span.end()` — independently of logs and metrics.
 
 ### Start and End a Span
 
@@ -410,12 +487,12 @@ let span = await CeburuAnalyticsSDK.shared.startSpan(
     "payment.flow",
     attrs: ["cart.id": "cart-123"]
 )
-span?.setAttribute(key: "order.id", value: "ORD-456")
-span?.setAttribute(key: "amount.usd", value: "99.99")
-span?.end()
+span.setAttribute(key: "order.id", value: "ORD-456")
+span.setAttribute(key: "amount.usd", value: "99.99")
+span.end()
 
 // On failure:
-span?.endWithError(PaymentError.declined)
+span.endWithError(PaymentError.declined)   // records status=ERROR + exception stack trace
 ```
 
 ### SpanKind
@@ -432,9 +509,9 @@ let span = await CeburuAnalyticsSDK.shared.startSpan(
 ### Span Events
 
 ```swift
-span?.addEvent(name: "cart.validated")
-span?.addEvent(name: "payment.initiated", attrs: ["gateway": "stripe", "amount": "99.99"])
-span?.addEvent(name: "payment.confirmed", attrs: ["transaction.id": "txn_001"])
+span.addEvent(name: "cart.validated")
+span.addEvent(name: "payment.initiated", attrs: ["gateway": "stripe", "amount": "99.99"])
+span.addEvent(name: "payment.confirmed", attrs: ["transaction.id": "txn_001"])
 ```
 
 ### Expected Collector Output
@@ -442,7 +519,7 @@ span?.addEvent(name: "payment.confirmed", attrs: ["transaction.id": "txn_001"])
 ```
 ResourceSpans #0
 Resource attributes:
-     -> tenant.id: Str(tenant-acme)    -> user.id: Str(user-john-001)
+     -> tenant.id: Str(tenant-acme)    -> enduser.id: Str(user-john-001)
 Span #0
     Name: payment.flow    Kind: Internal    Status: Unset
     Attributes:
@@ -455,7 +532,7 @@ Span #0
 
 ## Authentication & Token Rotation
 
-Every export request carries a Bearer token in the `Authorization` header (added to gRPC metadata). The token is customer-provided — never hardcode it; load from a secure remote config at startup.
+Every export request carries a Bearer token in the `Authorization` HTTP header. The token is customer-provided — never hardcode it; load from a secure remote config at startup.
 
 ### Setting the Token
 
@@ -463,68 +540,35 @@ Pass `authToken` in the Config at initialization (see [Initialization](#initiali
 
 ### Token Rotation
 
-Call `updateAuthToken()` to store a new token. It takes effect the next time a gRPC connection is established:
+Call `updateAuthToken()` to swap the token at runtime. It takes effect on the very next export batch — all three pipelines (logs, metrics, traces) are rebuilt immediately with the new token:
 
 ```swift
-await CeburuAnalyticsSDK.shared.updateAuthToken("new-token-xyz")
-```
-
-> **Note:** iOS uses gRPC `CallOptions` which are set at connection time. The new token is applied on the next connection — not mid-stream. This is a known limitation of the gRPC transport on iOS.
-
----
-
-## User Identity
-
-Each user of a tenant is identified through the `userId` config field. It appears as `user.id` on every telemetry signal (logs, metrics, traces) emitted during that session.
-
-> **Note:** Multiple users share the same `tenantId`. Each must have a distinct `userId` so their events can be distinguished in the collector.
-
-### Setting userId at Initialization
-
-Pass `userId` in the Config at initialization (see [Initialization](#initialization)).
-
-### Updating userId at Runtime
-
-Call `setUser()` on login, account switch, or logout:
-
-```swift
-await CeburuAnalyticsSDK.shared.setUser("user-john-001")  // after login
-await CeburuAnalyticsSDK.shared.setUser("")               // on logout — clears user.id
-```
-
-### Output — user.id in Resource Attributes
-
-All three signals carry `user.id` as a resource attribute alongside `tenant.id`:
-
-```
-Resource attributes:
-     -> tenant.id:     Str(tenant-acme)
-     -> user.id:       Str(user-john-001)
-     -> service.name:  Str(MyApp)
+try? await CeburuAnalyticsSDK.shared.updateAuthToken("new-token-xyz")
 ```
 
 ---
 
-## Telemetry Signal Endpoints — Three Separate Calls
+## Telemetry Signal Endpoints — Three Separate API Calls
 
-One SDK action can produce up to three separate gRPC calls, each to its own pipeline:
+One SDK action can produce up to three separate HTTP POST requests, each to its own endpoint:
 
-| Signal | gRPC Service | Timing |
+| Signal | Endpoint | Timing |
 |---|---|---|
-| Logs | `opentelemetry.proto.collector.logs.v1.LogsService/Export` | Within ~2 s |
-| Metrics | `opentelemetry.proto.collector.metrics.v1.MetricsService/Export` | Every `metricsExportInterval` s (default 60) |
-| Traces | `opentelemetry.proto.collector.trace.v1.TraceService/Export` | Within ~5 s of `span.end()` |
+| Logs | `POST /apm/v1/logs` | Within ~2 s |
+| Metrics | `POST /apm/v1/metrics` | Every `metricsExportInterval` s (default 60) |
+| Traces | `POST /apm/v1/traces` | Within ~5 s of `span.end()` |
 
-All three carry the same `tenant.id` and `user.id` resource attributes, enabling cross-signal correlation in the backend.
+All three carry the same `tenant.id`, `config_id`, and `enduser.id` resource attributes, enabling cross-signal correlation in the backend.
 
 ---
 
 ## Security Notes
 
-- The on-device queue is encrypted with AES-GCM using a key stored in the iOS Keychain
+- The on-device event queue is encrypted with AES-256-GCM using a key stored in the iOS Keychain
 - The Keychain key is protected with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`
-- Do not embed `collectorHost`, `tenantId`, or `applicationId` as hardcoded strings in production — load them from your remote config or backend at runtime
-- gRPC transport must use TLS in production — your account team's collector endpoint enforces this
+- Crash records are encrypted with AES-256-GCM at crash time using a key derived from the app bundle ID
+- All endpoints must use HTTPS in production — `useHTTPS: false` is for local development only
+- Do not embed `collectorHost`, `tenantId`, `applicationId`, or `configId` as hardcoded strings in production — load them from your remote config or backend at runtime
 
 ---
 
@@ -537,17 +581,16 @@ try? await CeburuAnalyticsSDK.shared.initialize(
     config: CeburuAnalyticsSDK.Config(
         // ...
         collectorHost: "localhost",  // simulator reaches the Mac on localhost
-        collectorPort: 4317,         // default gRPC OTLP port
+        collectorPort: 4318,         // standard OTLP/HTTP port
+        useHTTPS:      false,        // dev only — must be true in production
         // ...
     )
 )
 ```
 
-> **Note:** The iOS Simulator shares the Mac's network stack, so `localhost` and `127.0.0.1` both resolve to the Mac. On a physical device, use your Mac's LAN IP address instead (e.g. `192.168.1.10`).
+> **Note:** The iOS Simulator shares the Mac's network stack, so `localhost` resolves to the Mac. On a physical device, use your Mac's LAN IP address instead (e.g. `192.168.1.10`).
 
-gRPC requires TLS by default. To allow a plain-text local collector, the SDK must be initialized with `ClientConnection.insecure` — this is already the case when `collectorHost` resolves to a local address during development. Ensure your Docker collector exposes port `4317` (gRPC) and, if applicable, `4318` (HTTP/OTLP) for other tools.
-
-Add to `Info.plist` to allow local plain-text traffic:
+Add to your app's `Info.plist` to allow plain-text local traffic:
 
 ```xml
 <key>NSAppTransportSecurity</key>
@@ -556,3 +599,5 @@ Add to `Info.plist` to allow local plain-text traffic:
     <true/>
 </dict>
 ```
+
+Or use `network_security_config.xml` equivalent (see Apple's ATS documentation for domain-level exceptions).
