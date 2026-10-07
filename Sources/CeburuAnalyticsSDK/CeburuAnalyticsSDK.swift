@@ -25,7 +25,7 @@ public actor CeburuAnalyticsSDK {
     // telemetry.sdk.name and telemetry.sdk.version are always in sync with
     // the published artifact version without requiring manual updates in multiple places.
     static let sdkName    = "ceburu-analytics-sdk"
-    static let sdkVersion = "3.0.0"
+    static let sdkVersion = "3.1.0"
 
     // ── Severity ───────────────────────────────────────────────────────────────
 
@@ -105,6 +105,10 @@ public actor CeburuAnalyticsSDK {
         /// How often (in seconds) observable metrics are polled and exported.
         /// Default: 60 s. Reduce to 10 s during development for faster feedback.
         public let metricsExportInterval: TimeInterval
+        /// Use standard OTLP paths (`/v1/logs`, `/v1/metrics`, `/v1/traces`) instead
+        /// of the production paths (`/apm/v1/…`). Set `true` only when testing against
+        /// a local standard OTLP collector (e.g. `otelcol`). Default: `false`.
+        public let useStandardOTLPPaths: Bool
 
         /// Creates an SDK configuration.
         ///
@@ -141,7 +145,8 @@ public actor CeburuAnalyticsSDK {
             maxBatchBytes:         Int          = 512 * 1024,
             userId:                String       = "",
             authToken:             String       = "",
-            metricsExportInterval: TimeInterval = 60
+            metricsExportInterval: TimeInterval = 60,
+            useStandardOTLPPaths:  Bool         = false
         ) {
             self.serviceName           = serviceName
             self.serviceVersion        = serviceVersion
@@ -159,18 +164,41 @@ public actor CeburuAnalyticsSDK {
             self.userId                = userId
             self.authToken             = authToken
             self.metricsExportInterval = metricsExportInterval
+            self.useStandardOTLPPaths  = useStandardOTLPPaths
         }
     }
 
+    // ── Span context (TaskLocal) ───────────────────────────────────────────────
+
+    /// Task-local span context injected by ``withSpan(_:attrs:kind:_:)``.
+    /// Logs emitted inside a `withSpan` closure inherit these IDs automatically.
+    /// Reading from outside a `withSpan` closure returns `nil` — no span is active.
+    struct SpanContext: Sendable {
+        let traceId: String
+        let spanId:  String
+    }
+
+    @TaskLocal static var _spanContext: SpanContext? = nil
+
     // ── AppSpan ────────────────────────────────────────────────────────────────
 
-    /// Handle to an active trace span. Obtain via ``CeburuAnalyticsSDK/startSpan(name:attrs:kind:)``.
+    /// Handle to an active trace span. Obtain via ``CeburuAnalyticsSDK/startSpan(name:attrs:kind:)``
+    /// (legacy) or, preferably, ``CeburuAnalyticsSDK/withSpan(_:attrs:kind:_:)`` which scopes the
+    /// span automatically and is safe under concurrent callers.
     ///
     /// Always call ``end()`` or ``endWithError(_:)`` exactly once — an unclosed span leaks memory
     /// and is never exported. Use `defer { span.end() }` to guarantee cleanup.
     public final class AppSpan: @unchecked Sendable {
 
         private let span: (any OpenTelemetryApi.Span)?
+
+        // Exposed so withSpan() can bind the TaskLocal without accessing OTel globals.
+        var spanContext: SpanContext? {
+            guard let span else { return nil }
+            let ctx = span.context
+            guard ctx.isValid else { return nil }
+            return SpanContext(traceId: ctx.traceId.hexString, spanId: ctx.spanId.hexString)
+        }
 
         init(span: (any OpenTelemetryApi.Span)?) {
             self.span = span
@@ -223,7 +251,6 @@ public actor CeburuAnalyticsSDK {
         /// After this call the span is immutable and queued for export. Further attribute
         /// mutations or `addEvent` calls on this handle are silently ignored.
         public func end() {
-            if let span { OpenTelemetry.instance.contextProvider.removeContextForSpan(span) }
             span?.end()
         }
 
@@ -246,7 +273,6 @@ public actor CeburuAnalyticsSDK {
                 "exception.escaped":    AttributeValue.bool(true)
             ])
             span?.status = Status.error(description: error.localizedDescription)
-            if let span { OpenTelemetry.instance.contextProvider.removeContextForSpan(span) }
             span?.end()
         }
     }
@@ -263,6 +289,9 @@ public actor CeburuAnalyticsSDK {
     private var backoff    = RetryBackoff()
     private var adapters:  [LoggerAdapter] = []
     private var userId:    String = ""
+    // I8: stored handle so shutdown() can cancel the loop immediately rather than
+    // waiting for the current sleep to expire and risking a duplicate loop on re-init.
+    private var flushTask: Task<Void, Never>? = nil
 
     nonisolated(unsafe) private static var _crashStorage:    EncryptedStore?
     nonisolated(unsafe) private static var _crashSessionId:  String = ""
@@ -293,6 +322,21 @@ public actor CeburuAnalyticsSDK {
     ///           (e.g. Keychain unavailable, invalid host).
     public func initialize(config: Config) async throws {
         guard !running else { return }
+
+        // I9: Reject plaintext HTTP in release builds.
+        // useHTTPS: false is valid only for local dev; shipping it to production would
+        // transmit telemetry (including auth tokens and PII-adjacent attributes) in clear text.
+        #if !DEBUG
+        if !config.useHTTPS {
+            throw NSError(
+                domain: "CeburuAnalyticsSDK",
+                code:   -2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "useHTTPS must be true in production builds. " +
+                    "Set useHTTPS: false only for local development against an HTTP collector."]
+            )
+        }
+        #endif
 
         // Resolve device info before creating the bridge — AnalyticsBridge.init is
         // synchronous so it cannot call UIDevice itself. These values go into the
@@ -344,20 +388,43 @@ public actor CeburuAnalyticsSDK {
         installExceptionHandler()
         SignalCrashHandler.install(crashDir: storage.crashDir, sessionId: sessionId)
 
-        Task { [weak self] in
+        // I8: store the handle so shutdown() can cancel it immediately.
+        // Using do/catch on Task.sleep means a cancel() wakes the loop right away
+        // instead of waiting out the full 5–30 s sleep window.
+        flushTask = Task { [weak self] in
             while let self, await self.running {
+                guard !Task.isCancelled else { break }
+                let ns: UInt64
                 switch await self.flushPersisted() {
                 case .flushed:
                     await self.resetBackoff()
-                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    ns = 5_000_000_000
                 case .empty:
                     await self.resetBackoff()
-                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    ns = 30_000_000_000
                 case .failed:
                     let ms = await self.nextBackoff()
-                    try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
+                    ns = UInt64(ms) * 1_000_000
+                }
+                do {
+                    try await Task.sleep(nanoseconds: ns)
+                } catch {
+                    break  // cancelled during sleep — exit immediately
                 }
             }
+        }
+
+        // I5: report Keychain failure as a health counter so the backend can alert on it.
+        if await storage.keychainFailed {
+            await bridge.incrementCounter(
+                name: "mobile.sdk.keychain.failure",
+                value: 1,
+                attrs: ["storage.mode": "memory-only"]
+            )
+            await warn(
+                "Keychain unavailable — event queue is memory-only; events will not survive app restart",
+                attributes: ["sdk.health": "degraded", "storage.mode": "memory-only"]
+            )
         }
 
         await info(
@@ -516,8 +583,12 @@ public actor CeburuAnalyticsSDK {
     ///   - message:    Human-readable description of what failed.
     ///   - error:      Optional `Error` — its type and `localizedDescription` are added as attributes.
     ///   - attributes: Optional key-value metadata. PII keys are automatically redacted.
-    public func error(_ message: String, error: Error? = nil, attributes: [String: Any] = [:]) async {
-        await emit(.error, message, mergeError(attributes, error))
+    public nonisolated func error(_ message: String, error: Error? = nil, attributes: [String: Any] = [:]) async {
+        // I6: capture call stack HERE — nonisolated, so we're still on the caller's executor
+        // before the actor hop. Pre-stringify to [String: String] (Sendable) before crossing.
+        let stack = error != nil ? Thread.callStackSymbols : []
+        let sendable = Self.stringify(Self.mergeError(attributes, error, stack: stack))
+        await emitSendable(.error, message, sendable)
     }
 
     /// Emits a `FATAL` severity log event.
@@ -528,8 +599,11 @@ public actor CeburuAnalyticsSDK {
     ///   - message:    Human-readable description of the fatal condition.
     ///   - error:      Optional `Error` — its type and `localizedDescription` are added as attributes.
     ///   - attributes: Optional key-value metadata. PII keys are automatically redacted.
-    public func fatal(_ message: String, error: Error? = nil, attributes: [String: Any] = [:]) async {
-        await emit(.fatal, message, mergeError(attributes, error))
+    public nonisolated func fatal(_ message: String, error: Error? = nil, attributes: [String: Any] = [:]) async {
+        // I6: same pattern as error() — stack captured before actor hop.
+        let stack = error != nil ? Thread.callStackSymbols : []
+        let sendable = Self.stringify(Self.mergeError(attributes, error, stack: stack))
+        await emitSendable(.fatal, message, sendable)
     }
 
     // ── Metrics ────────────────────────────────────────────────────────────────
@@ -685,7 +759,45 @@ public actor CeburuAnalyticsSDK {
             case .internal: return .internal
             }
         }()
-        return await bridge?.startAppSpan(name: name, attrs: attrs, kind: otelKind) ?? AppSpan(span: nil)
+        return await bridge?.startAppSpan(name: name, attrs: attrs, kind: otelKind, userId: userId) ?? AppSpan(span: nil)
+    }
+
+    /// Starts a span, runs `body` with the span's trace/span IDs bound as a task-local,
+    /// then ends the span — even if `body` throws.
+    ///
+    /// Logs emitted inside `body` automatically carry the correct `trace_id` and `span_id`.
+    /// This is the concurrency-safe replacement for `startSpan()` / `span.end()`:
+    /// the task-local is scoped to `body`'s Task, so concurrent `withSpan` calls on
+    /// other Tasks never interfere with each other.
+    ///
+    /// ```swift
+    /// try await sdk.withSpan("checkout.flow", attrs: ["screen": "cart"]) {
+    ///     await sdk.info("payment started")   // carries trace_id + span_id
+    ///     try await performCheckout()
+    ///     await sdk.info("payment complete")  // same span
+    /// }
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - name:  Span name.
+    ///   - attrs: Initial span attributes.
+    ///   - kind:  Span kind. Defaults to `.internal`.
+    ///   - body:  Work to perform inside the span's scope.
+    public nonisolated func withSpan<T: Sendable>(
+        _ name:  String,
+        attrs:   [String: String] = [:],
+        kind:    SpanKind         = .internal,
+        _  body: () async throws -> T
+    ) async rethrows -> T {
+        let span = await startSpan(name: name, attrs: attrs, kind: kind)
+        if let ctx = span.spanContext {
+            return try await CeburuAnalyticsSDK.$_spanContext.withValue(ctx) {
+                defer { span.end() }
+                return try await body()
+            }
+        }
+        defer { span.end() }
+        return try await body()
     }
 
     // ── Shutdown ───────────────────────────────────────────────────────────────
@@ -715,9 +827,21 @@ public actor CeburuAnalyticsSDK {
         for adapter in adapters { await adapter.uninstall() }
         adapters.removeAll()
         running = false
+        // I8: cancel the flush loop immediately so re-initialization never inherits
+        // a stale loop that would start flushing alongside the new one.
+        flushTask?.cancel()
+        flushTask = nil
         SignalCrashHandler.uninstall()
         await bridge?.shutdown()
-        bridge = nil
+        // I8: clear all instance state so re-initialization starts from a known-clean slate.
+        bridge  = nil
+        storage = nil
+        config  = nil
+        breadcrumbs.removeAll()
+        policy  = Policy()
+        backoff = RetryBackoff()
+        userId  = ""
+        sessionId = UUID().uuidString
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────
@@ -738,7 +862,7 @@ public actor CeburuAnalyticsSDK {
             return
         }
 
-        var attrs = Security.redact(stringify(attributes))
+        var attrs = Security.redact(Self.stringify(attributes))
         attrs["service.name"]                = config.serviceName
         attrs["service.version"]             = config.serviceVersion
         attrs["deployment.environment.name"] = config.environment
@@ -754,19 +878,12 @@ public actor CeburuAnalyticsSDK {
                 .joined(separator: " | ")
         }
 
-        // Capture the span context that is active on this Task so logs emitted
-        // inside a span carry trace_id/span_id in the OTLP payload.  The IDs
-        // survive serialisation to disk: even events flushed on the next launch
-        // reconstruct the SpanContext correctly in emitBatch().
-        var traceId: String? = nil
-        var spanId:  String? = nil
-        if let activeSpan = OpenTelemetry.instance.contextProvider.activeSpan {
-            let ctx = activeSpan.context
-            if ctx.isValid {
-                traceId = ctx.traceId.hexString
-                spanId  = ctx.spanId.hexString
-            }
-        }
+        // I7: read from @TaskLocal (set by withSpan{}) instead of the OTel global context
+        // provider. The global provider is not safe under Swift concurrency: a concurrent
+        // startSpan() on another Task overwrites the global before this emit() reads it,
+        // attaching the wrong trace_id/span_id. TaskLocal is task-scoped and race-free.
+        let traceId = Self._spanContext?.traceId
+        let spanId  = Self._spanContext?.spanId
 
         let event = Event(
             eventId:         UUID().uuidString,
@@ -849,18 +966,26 @@ public actor CeburuAnalyticsSDK {
         }
     }
 
-    private func stringify(_ attrs: [String: Any]) -> [String: String] {
+    // Static so it can be called from nonisolated error()/fatal() before the actor hop.
+    private static func stringify(_ attrs: [String: Any]) -> [String: String] {
         attrs.mapValues { v in (v as? String) ?? "\(v)" }
     }
 
-    private func mergeError(_ attrs: [String: Any], _ error: Error?) -> [String: Any] {
+    // Thin actor-isolated bridge for the nonisolated error()/fatal() path.
+    // Accepts [String: String] (Sendable) produced before the actor hop; re-uses
+    // the full emit() pipeline including Security.redact() and quota enforcement.
+    private func emitSendable(_ severity: Severity, _ message: String, _ attrs: [String: String]) async {
+        await emit(severity, message, attrs as [String: Any])
+    }
+
+    private static func mergeError(_ attrs: [String: Any], _ error: Error?, stack: [String] = []) -> [String: Any] {
         guard let error else { return attrs }
         var out = attrs
-        out["exception.type"]       = String(describing: type(of: error))
-        out["exception.message"]    = error.localizedDescription
-        // H-4: capture stack symbols at the call site so error() and fatal() carry
-        // a stacktrace, matching what crash records and span.endWithError() already provide.
-        out["exception.stacktrace"] = Thread.callStackSymbols.joined(separator: "\n")
+        out["exception.type"]    = String(describing: type(of: error))
+        out["exception.message"] = error.localizedDescription
+        if !stack.isEmpty {
+            out["exception.stacktrace"] = stack.joined(separator: "\n")
+        }
         return out
     }
 

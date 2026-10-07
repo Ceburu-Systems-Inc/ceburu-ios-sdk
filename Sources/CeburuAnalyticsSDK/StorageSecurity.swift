@@ -102,6 +102,17 @@ actor EncryptedStore {
     private let maxAgeSeconds: TimeInterval
     private var lastPruneTime: Date = .distantPast
 
+    // I5: set when the Keychain is unavailable at init time. Events are held in RAM
+    // and never written to disk; the stale derivable-key fallback is gone.
+    private(set) var keychainFailed = false
+    private var memoryQueue: [(url: URL, data: Data)] = []
+    private static let memoryQueueCap = 500
+
+    // X2: random crash key loaded from Keychain in init(), cached here so
+    // nonisolated crash-time callers (persistBreadcrumbs/persistException)
+    // can read it without Keychain access or actor hops.
+    nonisolated(unsafe) private static var _crashKey: SymmetricKey? = nil
+
     /// Creates the encrypted store, initialising the queue and crash directories
     /// and loading (or generating) the AES key from the Keychain.
     ///
@@ -120,9 +131,37 @@ actor EncryptedStore {
         try FileManager.default.createDirectory(at: queueDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: crashDir, withIntermediateDirectories: true)
 
-        key = try KeyStore.loadOrCreate()
+        // I5: if Keychain is unavailable, fall back to memory-only mode instead of
+        // writing events to disk with a predictable derivable key.
+        var didFailKeychain = false
+        let loadedKey: SymmetricKey
+        do {
+            loadedKey = try KeyStore.loadOrCreate()
+        } catch {
+            // Random key used to satisfy the `let key` property; never touches disk in this mode.
+            var raw = Data(count: 32)
+            _ = raw.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+            loadedKey = SymmetricKey(data: raw)
+            didFailKeychain = true
+            // Clean up any stale queue files encrypted with the now-inaccessible key.
+            if let stale = try? FileManager.default.contentsOfDirectory(
+                at: queueDir, includingPropertiesForKeys: nil
+            ) {
+                for f in stale where f.pathExtension == "bin" { try? FileManager.default.removeItem(at: f) }
+            }
+        }
+        key = loadedKey
+        keychainFailed = didFailKeychain
         self.maxBytes = maxBytes
         self.maxAgeSeconds = TimeInterval(retentionHours * 3600)
+
+        // X2: load (or generate) the crash key now, while we are in a safe context,
+        // so nonisolated crash-time callers can read _crashKey without Keychain access.
+        // If the Keychain is unavailable we accept the derivable-key fallback rather than
+        // refusing to start — crash capture is better than no crash capture.
+        if !didFailKeychain {
+            Self._crashKey = try? KeyStore.loadOrCreateCrashKey()
+        }
     }
 
     /// Encrypts and enqueues a single event.
@@ -134,6 +173,14 @@ actor EncryptedStore {
     /// - Parameter event: The event to persist.
     /// - Throws: If JSON encoding, AES encryption, or the filesystem write fails.
     func enqueue(_ event: CeburuAnalyticsSDK.Event) throws {
+        if keychainFailed {
+            let data = try JSONEncoder().encode(event)
+            let url  = URL(string: "memory://\(event.eventId)")!
+            memoryQueue.append((url: url, data: data))
+            if memoryQueue.count > Self.memoryQueueCap { memoryQueue.removeFirst() }
+            return
+        }
+
         pruneOld()
 
         let clear = try JSONEncoder().encode(event)
@@ -167,6 +214,18 @@ actor EncryptedStore {
     /// - Returns: Array of `(fileURL, cleartext Data)` pairs ready for export.
     /// - Throws: If a file cannot be read or decrypted (corrupted files are skipped).
     func batch(maxEvents: Int, maxBytes: Int) throws -> [(URL, Data)] {
+        if keychainFailed {
+            var result: [(URL, Data)] = []
+            var total = 0
+            for item in memoryQueue {
+                if result.count >= maxEvents { break }
+                if total + item.data.count > maxBytes && !result.isEmpty { break }
+                result.append((item.url, item.data))
+                total += item.data.count
+            }
+            return result
+        }
+
         pruneOld()
 
         var result: [(URL, Data)] = []
@@ -205,6 +264,11 @@ actor EncryptedStore {
     ///
     /// - Parameter files: File URLs previously returned by ``batch(maxEvents:maxBytes:)``.
     func acknowledge(_ files: [URL]) {
+        if keychainFailed {
+            let toRemove = Set(files.map { $0.absoluteString })
+            memoryQueue.removeAll { toRemove.contains($0.url.absoluteString) }
+            return
+        }
         files.forEach { try? FileManager.default.removeItem(at: $0) }
     }
 
@@ -458,47 +522,93 @@ actor EncryptedStore {
             return data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: T.self) }
         }
 
-        guard let magic: UInt32 = read(UInt32.self), magic == 0x4D534947 else { return nil }
-        guard let sig: Int32    = read(Int32.self)                        else { return nil }
-        guard let tsMs: Int64   = read(Int64.self)                        else { return nil }
-        // H-2: read saved ASLR slide; older files that predate this field return nil → use 0 (no adjustment).
-        let savedSlide: Int64   = read(Int64.self) ?? 0
-        guard let sessionLen: UInt16 = read(UInt16.self)                  else { return nil }
+        guard let magic: UInt32 = read(UInt32.self) else { return nil }
+        let isPerFrame = magic == 0x4D534948
+        guard isPerFrame || magic == 0x4D534947 else { return nil }
+
+        guard let sig: Int32  = read(Int32.self)  else { return nil }
+        guard let tsMs: Int64 = read(Int64.self)  else { return nil }
+
+        // v1 only: single global slide field (removed in v2).
+        let legacySlide: Int64 = isPerFrame ? 0 : (read(Int64.self) ?? 0)
+
+        guard let sessionLen: UInt16 = read(UInt16.self) else { return nil }
 
         let slen = Int(sessionLen)
         guard slen > 0, offset + slen <= data.count else { return nil }
-        // sessionIdCStr includes null terminator — strip it
         let sessionId = String(bytes: data[offset..<(offset + slen - 1)], encoding: .utf8)
             ?? fallbackSessionId
         offset += slen
 
         guard let frameCount: UInt16 = read(UInt16.self) else { return nil }
 
-        // H-2: Compute the slide delta once for all frames.
-        // PC_adjusted = PC_saved - old_slide + new_slide  (modular 64-bit pointer arithmetic).
-        // This makes dladdr() resolve symbols correctly even though ASLR placed the binary at a
-        // different base address in this launch than it was in the launch that crashed.
-        // Resolve _dyld_get_image_vmaddr_slide via dlsym — the symbol is not re-exported
-        // from the Darwin module in Xcode 26+ SDKs but is still present in the dyld library.
-        typealias SlideFunc = @convention(c) (UInt32) -> Int
-        var currentSlide: Int64 = 0
-        if let sym = dlsym(dlopen(nil, RTLD_LAZY), "_dyld_get_image_vmaddr_slide") {
-            currentSlide = Int64(unsafeBitCast(sym, to: SlideFunc.self)(0))
-        }
+        typealias SlideFunc  = @convention(c) (UInt32) -> Int
+        typealias CountFunc  = @convention(c) () -> UInt32
+        typealias HeaderFunc = @convention(c) (UInt32) -> UnsafeRawPointer?
 
         var stackLines: [String] = []
-        for i in 0..<min(Int(frameCount), 32) {
-            guard let addr: UInt64 = read(UInt64.self) else { break }
-            let adjustedAddr = addr &- UInt64(bitPattern: savedSlide) &+ UInt64(bitPattern: currentSlide)
-            var info = Dl_info()
-            if dladdr(UnsafeRawPointer(bitPattern: UInt(adjustedAddr)), &info) != 0 {
-                let sym = info.dli_sname.map { String(cString: $0) } ?? "<unknown>"
-                let lib = info.dli_fname
-                    .map { URL(fileURLWithPath: String(cString: $0)).lastPathComponent } ?? "<unknown>"
-                let off = adjustedAddr - UInt64(UInt(bitPattern: info.dli_saddr))
-                stackLines.append("#\(i)  \(lib)  \(sym) + \(off)")
-            } else {
-                stackLines.append("#\(i)  0x\(String(adjustedAddr, radix: 16))")
+
+        if isPerFrame {
+            // v2: build preferredBase → currentBase lookup for all images in this launch.
+            var imageMap: [UInt64: UInt64] = [:]
+            let dyldHandle = dlopen(nil, RTLD_LAZY)
+            if let slideSym  = dlsym(dyldHandle, "_dyld_get_image_vmaddr_slide"),
+               let countSym  = dlsym(dyldHandle, "_dyld_image_count"),
+               let headerSym = dlsym(dyldHandle, "_dyld_get_image_header") {
+                let slideFunc  = unsafeBitCast(slideSym,  to: SlideFunc.self)
+                let countFunc  = unsafeBitCast(countSym,  to: CountFunc.self)
+                let headerFunc = unsafeBitCast(headerSym, to: HeaderFunc.self)
+                let imgCount   = Int(countFunc())
+                for j in 0..<imgCount {
+                    if let hdr = headerFunc(UInt32(j)) {
+                        let curBase       = UInt64(UInt(bitPattern: hdr))
+                        let curSlide      = Int64(slideFunc(UInt32(j)))
+                        let preferredBase = curBase &- UInt64(bitPattern: curSlide)
+                        imageMap[preferredBase] = curBase
+                    }
+                }
+            }
+            for i in 0..<min(Int(frameCount), 32) {
+                guard let addrRel: UInt64       = read(UInt64.self) else { break }
+                guard let preferredBase: UInt64 = read(UInt64.self) else { break }
+                if preferredBase == 0 {
+                    stackLines.append("#\(i)  0x\(String(addrRel, radix: 16))")
+                    continue
+                }
+                // If the image was loaded in this launch, use its current base; otherwise
+                // fall back to preferredBase (slide = 0), which is wrong but still useful.
+                let curBase = imageMap[preferredBase] ?? preferredBase
+                let adjustedAddr = addrRel &+ curBase
+                var info = Dl_info()
+                if dladdr(UnsafeRawPointer(bitPattern: UInt(adjustedAddr)), &info) != 0 {
+                    let sym = info.dli_sname.map { String(cString: $0) } ?? "<unknown>"
+                    let lib = info.dli_fname
+                        .map { URL(fileURLWithPath: String(cString: $0)).lastPathComponent } ?? "<unknown>"
+                    let off = adjustedAddr - UInt64(UInt(bitPattern: info.dli_saddr))
+                    stackLines.append("#\(i)  \(lib)  \(sym) + \(off)")
+                } else {
+                    stackLines.append("#\(i)  0x\(String(adjustedAddr, radix: 16))")
+                }
+            }
+        } else {
+            // v1: single global slide — adjust all frames by the same delta.
+            var currentSlide: Int64 = 0
+            if let sym = dlsym(dlopen(nil, RTLD_LAZY), "_dyld_get_image_vmaddr_slide") {
+                currentSlide = Int64(unsafeBitCast(sym, to: SlideFunc.self)(0))
+            }
+            for i in 0..<min(Int(frameCount), 32) {
+                guard let addr: UInt64 = read(UInt64.self) else { break }
+                let adjustedAddr = addr &- UInt64(bitPattern: legacySlide) &+ UInt64(bitPattern: currentSlide)
+                var info = Dl_info()
+                if dladdr(UnsafeRawPointer(bitPattern: UInt(adjustedAddr)), &info) != 0 {
+                    let sym = info.dli_sname.map { String(cString: $0) } ?? "<unknown>"
+                    let lib = info.dli_fname
+                        .map { URL(fileURLWithPath: String(cString: $0)).lastPathComponent } ?? "<unknown>"
+                    let off = adjustedAddr - UInt64(UInt(bitPattern: info.dli_saddr))
+                    stackLines.append("#\(i)  \(lib)  \(sym) + \(off)")
+                } else {
+                    stackLines.append("#\(i)  0x\(String(adjustedAddr, radix: 16))")
+                }
             }
         }
 
@@ -556,6 +666,7 @@ enum KeyStore {
 
     private static let service = "com.ceburu.analytics"
     private static let account = "queue-key"
+    private static let crashAccount = "crash-key"
 
     /// Loads the existing AES key from the Keychain, or generates and stores a new one.
     ///
@@ -587,14 +698,41 @@ enum KeyStore {
         }
     }
 
+    // X2: separate Keychain slot for the crash-record key so it can be rotated
+    // independently from the event-queue key.
+    /// Loads the crash-record AES key from the Keychain, or generates and stores a new one.
+    ///
+    /// - Returns: The 256-bit `SymmetricKey` used to encrypt crash `.enc` files.
+    /// - Throws: `NSError(domain: "Ceburu.Keychain", ...)` if the Keychain operation fails.
+    static func loadOrCreateCrashKey() throws -> SymmetricKey {
+        if let existing = try loadForAccount(crashAccount) {
+            return SymmetricKey(data: existing)
+        }
+
+        var data = Data(count: 32)
+        let status = data.withUnsafeMutableBytes {
+            SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!)
+        }
+        guard status == errSecSuccess else {
+            throw NSError(domain: "Ceburu.Keychain", code: Int(status))
+        }
+
+        try saveForAccount(crashAccount, data: data)
+        return SymmetricKey(data: data)
+    }
+
     /// Attempts to load the key from the Keychain. Returns `nil` if not found.
     ///
     /// - Throws: If the Keychain query returns an error other than `errSecItemNotFound`.
     private static func load() throws -> Data? {
+        try loadForAccount(account)
+    }
+
+    private static func loadForAccount(_ acct: String) throws -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+            kSecAttrAccount as String: acct,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -618,10 +756,14 @@ enum KeyStore {
     /// - Parameter data: 32-byte raw key material.
     /// - Throws: If `SecItemAdd` returns an error.
     private static func save(_ data: Data) throws {
+        try saveForAccount(account, data: data)
+    }
+
+    private static func saveForAccount(_ acct: String, data: Data) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+            kSecAttrAccount as String: acct,
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]

@@ -29,6 +29,10 @@ let package = Package(
                 .product(name: "OpenTelemetrySdk",                   package: "opentelemetry-swift-core"),
                 .product(name: "OpenTelemetryProtocolExporterHTTP",   package: "opentelemetry-swift")
             ]
+        ),
+        .testTarget(
+            name: "CeburuAnalyticsSDKTests",
+            dependencies: ["CeburuAnalyticsSDK"]
         )
     ]
 )

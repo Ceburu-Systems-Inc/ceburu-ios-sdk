@@ -219,7 +219,10 @@ public final class OSLogAdapter: LoggerAdapter, @unchecked Sendable {
     ///   - message:    Human-readable log message.
     ///   - attributes: Optional key-value metadata forwarded to the collector. PII keys are redacted.
     public func debug(_ message: String, attributes: [String: Any] = [:]) {
-        osLogger.debug("\(message, privacy: .public)")
+        // I11: .private hides the message body in Console.app / log stream so raw PII in the
+        // message string is not exposed to diagnostic tools before SDK redaction runs.
+        // The SDK collector still receives the full message via MobileLogSink below.
+        osLogger.debug("\(message, privacy: .private)")
         MobileLogSink.logSync(level: "DEBUG", message: message, attributes: attributes)
     }
 
@@ -229,7 +232,7 @@ public final class OSLogAdapter: LoggerAdapter, @unchecked Sendable {
     ///   - message:    Human-readable log message.
     ///   - attributes: Optional key-value metadata forwarded to the collector. PII keys are redacted.
     public func info(_ message: String, attributes: [String: Any] = [:]) {
-        osLogger.info("\(message, privacy: .public)")
+        osLogger.info("\(message, privacy: .private)")
         MobileLogSink.logSync(level: "INFO", message: message, attributes: attributes)
     }
 
@@ -239,7 +242,7 @@ public final class OSLogAdapter: LoggerAdapter, @unchecked Sendable {
     ///   - message:    Human-readable log message.
     ///   - attributes: Optional key-value metadata forwarded to the collector. PII keys are redacted.
     public func warning(_ message: String, attributes: [String: Any] = [:]) {
-        osLogger.warning("\(message, privacy: .public)")
+        osLogger.warning("\(message, privacy: .private)")
         MobileLogSink.logSync(level: "WARN", message: message, attributes: attributes)
     }
 
@@ -251,7 +254,7 @@ public final class OSLogAdapter: LoggerAdapter, @unchecked Sendable {
     ///   - message:    Human-readable description of the error.
     ///   - attributes: Optional key-value metadata forwarded to the collector. PII keys are redacted.
     public func error(_ message: String, attributes: [String: Any] = [:]) {
-        osLogger.error("\(message, privacy: .public)")
+        osLogger.error("\(message, privacy: .private)")
         MobileLogSink.logSync(level: "ERROR", message: message, attributes: attributes)
     }
 
@@ -263,7 +266,7 @@ public final class OSLogAdapter: LoggerAdapter, @unchecked Sendable {
     ///   - message:    Human-readable description of the fatal condition.
     ///   - attributes: Optional key-value metadata forwarded to the collector. PII keys are redacted.
     public func critical(_ message: String, attributes: [String: Any] = [:]) {
-        osLogger.critical("\(message, privacy: .public)")
+        osLogger.critical("\(message, privacy: .private)")
         MobileLogSink.logSync(level: "FATAL", message: message, attributes: attributes)
     }
 }

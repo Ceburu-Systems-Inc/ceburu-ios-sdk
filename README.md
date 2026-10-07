@@ -18,7 +18,7 @@ Add the SDK via Swift Package Manager in Xcode:
 
 1. **File → Add Package Dependencies**
 2. Enter the repository URL provided by your account team
-3. Select version `3.0.0` (or **Up to Next Major Version** from `3.0.0`)
+3. Select version `3.1.0` (or **Up to Next Major Version** from `3.1.0`)
 4. Select **CeburuAnalyticsSDK** as the library to add to your target
 
 ---

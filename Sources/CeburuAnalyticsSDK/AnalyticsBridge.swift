@@ -68,13 +68,14 @@ actor AnalyticsBridge {
         self.currentToken          = config.authToken
         self.metricsExportInterval = config.metricsExportInterval
 
-        let scheme = config.useHTTPS ? "https" : "http"
-        let base   = "\(scheme)://\(config.collectorHost):\(config.collectorPort)"
+        let scheme     = config.useHTTPS ? "https" : "http"
+        let base       = "\(scheme)://\(config.collectorHost):\(config.collectorPort)"
+        let pathPrefix = config.useStandardOTLPPaths ? "" : "/apm"
 
         guard
-            let logsURL    = URL(string: "\(base)/apm/v1/logs"),
-            let tracesURL  = URL(string: "\(base)/apm/v1/traces"),
-            let metricsURL = URL(string: "\(base)/apm/v1/metrics")
+            let logsURL    = URL(string: "\(base)\(pathPrefix)/v1/logs"),
+            let tracesURL  = URL(string: "\(base)\(pathPrefix)/v1/traces"),
+            let metricsURL = URL(string: "\(base)\(pathPrefix)/v1/metrics")
         else {
             throw NSError(domain: "CeburuAnalyticsSDK", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "Invalid collectorHost: \(config.collectorHost)"])
@@ -91,7 +92,9 @@ actor AnalyticsBridge {
             "tenant.id":                      AttributeValue.string(config.tenantId),
             "application.id":                 AttributeValue.string(config.applicationId),
             "config_id":                      AttributeValue.string(config.configId),
-            "enduser.id":                     AttributeValue.string(config.userId),
+            // X1: enduser.id is NOT a Resource attribute — Resource describes the service, not
+            // the current user. Baking it here freezes it at init time and ignores setUser()
+            // calls. It is injected per-event in emit() (logs) and startAppSpan() (spans).
             "service.instance.id":            AttributeValue.string(UUID().uuidString),
             "device.manufacturer":            AttributeValue.string("Apple"),
             "device.model.name":              AttributeValue.string(deviceModel),
@@ -308,61 +311,29 @@ actor AnalyticsBridge {
     ///
     /// - Parameter events: Events decoded from the on-disk queue.
     /// - Returns: `true` if the collector returned HTTP 2xx; `false` on network error or non-2xx.
-    func emitBatch(_ events: [CeburuAnalyticsSDK.Event]) -> Bool {
-        guard let logExporter else { return false }
+    func emitBatch(_ events: [CeburuAnalyticsSDK.Event]) async -> Bool {
+        guard !events.isEmpty else { return true }
+        guard let bodyData = try? JSONSerialization.data(
+            withJSONObject: buildOTLPLogsPayload(events)
+        ) else { return false }
 
-        let scope = InstrumentationScopeInfo(name: CeburuAnalyticsSDK.sdkName,
-                                             version: CeburuAnalyticsSDK.sdkVersion)
-
-        // Build ReadableLogRecord values directly — ReadableLogRecord is a concrete struct
-        // in opentelemetry-swift-core 2.x, not a protocol.
-        let records: [ReadableLogRecord] = events.map { event in
-            var attrs: [String: AttributeValue] = [
-                "event.id":             .string(event.eventId),
-                "session.id":           .string(event.sessionId),
-                "telemetry.event.type": .string(event.type)
-            ]
-            for (key, value) in event.attributes {
-                attrs[key] = .string(value)
-            }
-
-            // Reconstruct the SpanContext that was active when this event was captured.
-            // traceId/spanId are stored on the Event at enqueue time (from the OTel context
-            // provider); they survive serialisation to disk so flushed-on-next-launch events
-            // still carry the correct trace_id and span_id in the OTLP payload.
-            var spanCtx: SpanContext? = nil
-            if let traceHex = event.traceId, let spanHex = event.spanId {
-                let traceId = TraceId(fromHexString: traceHex)
-                let spanId  = SpanId(fromHexString: spanHex)
-                if traceId.isValid && spanId.isValid {
-                    spanCtx = SpanContext.createFromRemoteParent(
-                        traceId:    traceId,
-                        spanId:     spanId,
-                        traceFlags: TraceFlags(fromByte: 0x01),   // sampled
-                        traceState: TraceState()
-                    )
-                }
-            }
-
-            return ReadableLogRecord(
-                resource:                 resource,
-                instrumentationScopeInfo: scope,
-                timestamp:                Date(timeIntervalSince1970: Double(event.timestampUnixMs) / 1000),
-                observedTimestamp:        Date(),
-                spanContext:              spanCtx,
-                severity:                 mapSeverity(event.severity),
-                body:                     .string(event.message),
-                attributes:               attrs
-            )
+        // Direct URLSession call with an OTLP/JSON body: delivery is confirmed by the real HTTP
+        // status code. OtlpHttpLogExporter.export() returns before the response arrives, so its
+        // forceFlush() cannot prove delivery.
+        var request = URLRequest(url: logsEndpoint, timeoutInterval: 30)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !currentToken.isEmpty {
+            request.setValue("Bearer \(currentToken)", forHTTPHeaderField: "Authorization")
         }
+        request.httpBody = bodyData
 
-        // export() queues records but always returns .success immediately (fire-and-forget).
-        // forceFlush() sends the queued batch synchronously (blocks on a DispatchSemaphore)
-        // and returns the actual HTTP result — .success only on HTTP 2xx.
-        _ = logExporter.export(logRecords: records)
-        switch logExporter.forceFlush(explicitTimeout: 30) {
-        case .success: return true
-        case .failure: return false
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return false }
+            return (200..<300).contains(http.statusCode)
+        } catch {
+            return false
         }
     }
 
@@ -449,15 +420,20 @@ actor AnalyticsBridge {
     // ── App-level traces ───────────────────────────────────────────────────────
 
     func startAppSpan(
-        name:  String,
-        attrs: [String: String],
-        kind:  OpenTelemetryApi.SpanKind
+        name:   String,
+        attrs:  [String: String],
+        kind:   OpenTelemetryApi.SpanKind,
+        userId: String
     ) -> CeburuAnalyticsSDK.AppSpan {
         guard let tracer else { return CeburuAnalyticsSDK.AppSpan(span: nil) }
         let builder = tracer.spanBuilder(spanName: name).setSpanKind(spanKind: kind)
         attrs.forEach { k, v in _ = builder.setAttribute(key: k, value: AttributeValue.string(v)) }
+        // X1: inject enduser.id per-span so it reflects the current user identity at span
+        // creation time, not the frozen value from the Resource set at SDK init.
+        if !userId.isEmpty {
+            _ = builder.setAttribute(key: "enduser.id", value: AttributeValue.string(userId))
+        }
         let span = builder.startSpan()
-        OpenTelemetry.instance.contextProvider.setActiveSpan(span)
         return CeburuAnalyticsSDK.AppSpan(span: span)
     }
 
@@ -496,6 +472,66 @@ actor AnalyticsBridge {
         sdkEventsDroppedCounter = nil
         sdkExportSuccessCounter = nil
         sdkExportFailureCounter = nil
+
+        // H-1: clear cached instrument objects so they are recreated against the
+        // new meterSdk after a token rotation — stale instruments silently drop data.
+        appCounters.removeAll()
+        appUpDownCounters.removeAll()
+        appHistograms.removeAll()
+    }
+
+    private func buildOTLPLogsPayload(_ events: [CeburuAnalyticsSDK.Event]) -> [String: Any] {
+        let resourceAttrs: [[String: Any]] = resource.attributes.map { key, value in
+            ["key": key, "value": ["stringValue": value.description]]
+        }
+        let logRecords: [[String: Any]] = events.map { event in
+            var attrs: [[String: Any]] = [
+                ["key": "event.id",             "value": ["stringValue": event.eventId]],
+                ["key": "session.id",           "value": ["stringValue": event.sessionId]],
+                ["key": "telemetry.event.type", "value": ["stringValue": event.type]]
+            ]
+            for (k, v) in event.attributes {
+                attrs.append(["key": k, "value": ["stringValue": v]])
+            }
+            let timeNs = String(event.timestampUnixMs * 1_000_000)
+            var record: [String: Any] = [
+                "timeUnixNano":         timeNs,
+                "observedTimeUnixNano": timeNs,
+                "severityNumber":       otlpSeverityNumber(event.severity),
+                "severityText":         otlpSeverityText(event.severity),
+                "body":                 ["stringValue": event.message],
+                "attributes":           attrs
+            ]
+            if let t = event.traceId { record["traceId"] = t }
+            if let s = event.spanId  { record["spanId"]  = s }
+            return record
+        }
+        return [
+            "resourceLogs": [[
+                "resource":  ["attributes": resourceAttrs],
+                "scopeLogs": [[
+                    "scope":      ["name": CeburuAnalyticsSDK.sdkName,
+                                   "version": CeburuAnalyticsSDK.sdkVersion],
+                    "logRecords": logRecords
+                ]]
+            ]]
+        ]
+    }
+
+    private func otlpSeverityNumber(_ s: CeburuAnalyticsSDK.Severity) -> Int {
+        switch s {
+        case .trace: return 1;  case .debug: return 5
+        case .info:  return 9;  case .warn:  return 13
+        case .error: return 17; case .fatal: return 21
+        }
+    }
+
+    private func otlpSeverityText(_ s: CeburuAnalyticsSDK.Severity) -> String {
+        switch s {
+        case .trace: return "TRACE"; case .debug: return "DEBUG"
+        case .info:  return "INFO";  case .warn:  return "WARN"
+        case .error: return "ERROR"; case .fatal: return "FATAL"
+        }
     }
 
     private func mapSeverity(_ severity: CeburuAnalyticsSDK.Severity) -> OpenTelemetryApi.Severity {
