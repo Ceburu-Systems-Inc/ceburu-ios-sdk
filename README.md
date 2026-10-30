@@ -25,15 +25,14 @@ distribute the replacement through an app update or your own configuration servi
 
 ## 2. Install
 
-**This is the unreleased 1.0.0 candidate.** The version below becomes available after its Git tag is published.
-For local evaluation, add this checkout as a local Swift package. The first release still needs macOS CI and
-an iOS device/simulator smoke test.
+**Beta for evaluation: 1.0.0-beta.1.** Pin the beta explicitly after its Git tag is published.
+Device delivery and overhead validation remain open; this is not a production-certified release.
 
-Xcode: **File → Add Package Dependencies…** → `https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk`, version 1.0.0
-or later, product `CeburuAnalyticsSDK`. Or in `Package.swift`:
+Xcode: **File → Add Package Dependencies…** → `https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk`,
+**Exact Version** `1.0.0-beta.1`, product `CeburuAnalyticsSDK`. Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk.git", from: "1.0.0")
+.package(url: "https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk.git", exact: "1.0.0-beta.1")
 // target dependency:
 .product(name: "CeburuAnalyticsSDK", package: "ceburu-ios-sdk")
 ```

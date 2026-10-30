@@ -147,6 +147,18 @@ final class SDKBehaviorTests: XCTestCase {
         XCTAssertEqual(AnalyticsBridge.outcome(status: 503, retryAfter: "Fri, 15 Jan 2027 08:01:00 GMT", now: now), .retry(after: 60))
     }
 
+    func testStaleUnauthorizedResponseCannotPauseRotatedKey() throws {
+        var auth = CeburuAnalyticsSDK.LogAuthorization()
+        let old = try XCTUnwrap(auth.attempt)
+        auth.update()
+        auth.reject(old)
+        let current = try XCTUnwrap(auth.attempt)
+        auth.reject(current)
+        XCTAssertNil(auth.attempt)
+        auth.update()
+        XCTAssertNotNil(auth.attempt)
+    }
+
     // MARK: - Consent generations (R6)
 
     func testFilesFromBeforeAWithdrawalAreNeverSent() {

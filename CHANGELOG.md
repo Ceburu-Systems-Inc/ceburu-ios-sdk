@@ -4,7 +4,11 @@ All notable changes to the Ceburu RUM SDK for iOS (`ceburu-ios-sdk`, Swift packa
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 The wire contract (attribute names) is part of the public API.
 
-## [1.0.0] - Unreleased
+## [1.0.0-beta.1] - 2026-10-30
+
+### Fixed
+- Synchronize metric exporter state for Swift 6 concurrency checks.
+- Ignore stale unauthorized responses after key replacement; keep pausing for a refused current key.
 
 ### Added (SDK and ingest review, 2026-10-29)
 - Automatic capture (`Config.autoCapture`, on by default): `screen_view` for UIKit view controllers of the app's

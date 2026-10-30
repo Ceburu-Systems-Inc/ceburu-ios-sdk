@@ -21,7 +21,7 @@ public actor CeburuAnalyticsSDK {
 
     // Sent as telemetry.distro.name/version; keep sdkVersion equal to the release tag.
     static let sdkName    = "ceburu-ios-sdk"
-    static let sdkVersion = "1.0.0"
+    static let sdkVersion = "1.0.0-beta.1"
 
     // ── Severity ───────────────────────────────────────────────────────────────
 
@@ -268,7 +268,7 @@ public actor CeburuAnalyticsSDK {
     private var lastActivity = Date()
     private var sessionSavedAt = Date.distantPast
     private var consent    = true
-    private var authPaused = false
+    private var authorization = LogAuthorization()
     private var batchEvents = 200
     private var breadcrumbs: [Breadcrumb] = []
     private var running    = false
@@ -372,7 +372,7 @@ public actor CeburuAnalyticsSDK {
         self.bridge  = bridge
         self.gate    = gate
         self.consent = config.consentGranted
-        self.authPaused = false
+        self.authorization.update()
         self.batchEvents = max(1, config.maxBatchEvents)
         self.running = true
 
@@ -467,7 +467,7 @@ public actor CeburuAnalyticsSDK {
     /// export pipelines; in-flight data is flushed first.
     public func updateApiKey(_ apiKey: String) async {
         await bridge?.updateToken(apiKey)
-        authPaused = false
+        authorization.update()
     }
 
     /// Grants or withdraws consent. While withdrawn nothing is recorded or sent (logs, spans, metrics,
@@ -1079,8 +1079,18 @@ public actor CeburuAnalyticsSDK {
 
     private enum FlushResult { case flushed, empty, failed(after: TimeInterval?) }
 
+    struct LogAuthorization {
+        private var revision = 0
+        private var paused = false
+        var attempt: Int? { paused ? nil : revision }
+        mutating func update() { revision += 1; paused = false }
+        mutating func reject(_ attempt: Int) {
+            if attempt == revision { paused = true }
+        }
+    }
+
     private func flushPersisted() async -> FlushResult {
-        guard consent, !authPaused, let storage, let bridge else { return .empty }
+        guard consent, let authAttempt = authorization.attempt, let storage, let bridge else { return .empty }
         let generation = gate.generation
         do {
             let rows = try await storage.batch(
@@ -1114,7 +1124,7 @@ public actor CeburuAnalyticsSDK {
                 return .flushed
             case .unauthorized:
                 // Keep the queue and stop sending until updateApiKey(_:) or the next launch.
-                authPaused = true
+                authorization.reject(authAttempt)
                 return .failed(after: nil)
             case .tooLarge:
                 if validFiles.count == 1 { await storage.acknowledge(validFiles) } else { batchEvents = max(1, validFiles.count / 2) }
