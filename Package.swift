@@ -5,7 +5,7 @@ let package = Package(
     name: "CeburuAnalyticsSDK",
     platforms: [
         .iOS(.v15),
-        .macOS(.v12)   // required for swift build on macOS (CLI / CI); iOS is the primary target
+        .macOS(.v12)   // only so `swift build` / `swift test` run on macOS CI; iOS is the supported target
     ],
     products: [
         .library(name: "CeburuAnalyticsSDK", targets: ["CeburuAnalyticsSDK"])
@@ -28,7 +28,8 @@ let package = Package(
                 .product(name: "OpenTelemetryApi",                   package: "opentelemetry-swift-core"),
                 .product(name: "OpenTelemetrySdk",                   package: "opentelemetry-swift-core"),
                 .product(name: "OpenTelemetryProtocolExporterHTTP",   package: "opentelemetry-swift")
-            ]
+            ],
+            resources: [.copy("PrivacyInfo.xcprivacy")]
         ),
         .testTarget(
             name: "CeburuAnalyticsSDKTests",

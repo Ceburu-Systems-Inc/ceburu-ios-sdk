@@ -1,0 +1,7 @@
+Ceburu RUM SDK for iOS (ceburu-ios-sdk)
+Copyright 2026 Ceburu Systems Inc
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It depends on the following third-party software, each under its own license:
+- OpenTelemetry Swift (opentelemetry-swift, opentelemetry-swift-core) - Apache License 2.0 - https://github.com/open-telemetry/opentelemetry-swift

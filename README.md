@@ -1,603 +1,203 @@
-# CeburuAnalyticsSDK — iOS
+# Ceburu RUM SDK for iOS
 
-Enterprise-grade OpenTelemetry logging SDK for iOS. Captures log events from your app, encrypts them on-device, and delivers them to your assigned Ceburu Collector endpoint via OTLP/HTTP.
+Real user monitoring for iOS apps. Sends logs, errors, crashes and spans to Ceburu over OTLP, with an
+encrypted log queue, sessions and redaction. Custom metrics are off by default. It works alongside
+[`@ceburu/rum-web`](https://github.com/Ceburu-Systems-Inc/ceburu-rum-web) and the
+[Android SDK](https://github.com/Ceburu-Systems-Inc/ceburu-android-sdk); all three share one data contract.
 
----
+- iOS 15+, Xcode 16+ (Swift 6 toolchain), Swift Package Manager, Apache-2.0.
+- Built on [OpenTelemetry Swift](https://github.com/open-telemetry/opentelemetry-swift) with private providers — it
+  never registers the global `OpenTelemetry` instance, so your app's own OpenTelemetry setup is untouched.
+- Ships a `PrivacyInfo.xcprivacy` privacy manifest.
 
-## Requirements
+## 1. Before you start
 
-- iOS 15+
-- Swift 5.9+
-- Xcode 15+
+In Ceburu, add an **iOS** app on the Real User Monitoring setup page. It gives you:
 
----
+| You get | Used as |
+| --- | --- |
+| RUM endpoint, `https://<ingest-host>/rum` | `endpoint` |
+| App key, `cbr_mob_…` (public, safe to ship in the app) | `apiKey` |
 
-## Installation
+The key only writes RUM data for that app; it cannot read data or log a user in. It can be extracted from the app.
+Keep your application's normal login separate. Key rotation uses the grace period selected on the setup page;
+distribute the replacement through an app update or your own configuration service.
 
-Add the SDK via Swift Package Manager in Xcode:
+## 2. Install
 
-1. **File → Add Package Dependencies**
-2. Enter the repository URL provided by your account team
-3. Select version `3.1.0` (or **Up to Next Major Version** from `3.1.0`)
-4. Select **CeburuAnalyticsSDK** as the library to add to your target
+**This is the unreleased 1.0.0 candidate.** The version below becomes available after its Git tag is published.
+For local evaluation, add this checkout as a local Swift package. The first release still needs macOS CI and
+an iOS device/simulator smoke test.
 
----
-
-## Initialization
-
-Initialize the SDK once in your `AppDelegate` or `App` entry point before any logging calls.
+Xcode: **File → Add Package Dependencies…** → `https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk`, version 1.0.0
+or later, product `CeburuAnalyticsSDK`. Or in `Package.swift`:
 
 ```swift
+.package(url: "https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk.git", from: "1.0.0")
+// target dependency:
+.product(name: "CeburuAnalyticsSDK", package: "ceburu-ios-sdk")
+```
+
+## 3. Initialize
+
+```swift
+import SwiftUI
 import CeburuAnalyticsSDK
 
 @main
-struct MyApp: App {
+struct ShopApp: App {
     init() {
         Task {
-            try? await CeburuAnalyticsSDK.shared.initialize(
-                config: CeburuAnalyticsSDK.Config(
-                    // ── Required ──────────────────────────────────────────────
-                    serviceName:    "MyApp",
-                    serviceVersion: "x.x.x",
-                    environment:    "production",
-                    tenantId:       "<your-tenant-id>",        // provided by account team
-                    applicationId:  "<your-application-id>",   // provided by account team
-                    configId:       "<your-config-id>",        // provided by account team
-                    collectorHost:  "<your-collector-host>",   // provided by account team
-                    userId:         "<user-id>",               // unique per user; update at login/logout
-                    authToken:      "<your-customer-token>",   // Bearer token for collector auth
-
-                    // ── Optional ──────────────────────────────────────────────
-                    collectorPort:         4318,     // OTLP/HTTP port (default: 4318)
-                    useHTTPS:              true,     // must be true in production
-                    queueMaxBytes:         52428800, // 50 MB on-device queue limit
-                    retentionHours:        72,       // hours to retain events if delivery fails
-                    maxBatchEvents:        200,      // max events per export batch
-                    maxBatchBytes:         524288,   // 512 KB max payload per batch
-                    metricsExportInterval: 60        // seconds between metric exports (default: 60)
-                )
-            )
+            do {
+                try await CeburuAnalyticsSDK.shared.initialize(config: .init(
+                    endpoint:       "https://<ingest-host>/rum",
+                    apiKey:         "<cbr_mob_ key>",
+                    serviceName:    "shop-ios",
+                    consentGranted: false
+                ))
+            } catch {
+                // Monitoring is optional; let the app continue if initialization fails.
+                print("Ceburu monitoring could not start")
+            }
         }
     }
-
-    var body: some Scene {
-        WindowGroup { ContentView() }
-    }
+    var body: some Scene { WindowGroup { ContentView() } }
 }
 ```
 
-> **Note:** `collectorHost`, `tenantId`, `applicationId`, and `configId` are provided by your account team. Do not hardcode placeholder values in production builds.
+Initialize once. The example waits for your app's consent decision; after initialization completes, call
+`await CeburuAnalyticsSDK.shared.setConsent(true)` when permission is granted. If omitted, `consentGranted`
+defaults to `true`. Only endpoint, key and service name are required. Configuration and storage errors can throw;
+catch them without interrupting your app. Supply `serviceVersion` to compare your app releases.
 
-### Config Reference
+<details>
+<summary>All options and defaults</summary>
 
-| Parameter | Required | Default | Description |
-|---|---|---|---|
-| `serviceName` | **Required** | — | App name in collector |
-| `serviceVersion` | **Required** | — | App version string |
-| `environment` | **Required** | — | `"production"`, `"staging"`, etc. |
-| `tenantId` | **Required** | — | Tenant identifier (from account team) |
-| `applicationId` | **Required** | — | Bundle ID (from account team) |
-| `configId` | **Required** | `""` | Ceburu configuration ID — routes signals to the correct tenant index on the edge. Provided by account team. |
-| `collectorHost` | **Required** | — | OTLP/HTTP collector host (from account team) |
-| `userId` | **Required** | `""` | Unique per user; update at login/logout with `setUser()` |
-| `authToken` | **Required** | `""` | Customer-provided Bearer token |
-| `collectorPort` | Optional | `4318` | OTLP/HTTP port |
-| `useHTTPS` | Optional | `true` | Use HTTPS — must be `true` in production |
-| `queueMaxBytes` | Optional | `52428800` (50 MB) | On-device queue size limit |
-| `retentionHours` | Optional | `72` | Hours to retain events if delivery fails |
-| `maxBatchEvents` | Optional | `200` | Max events per export batch |
-| `maxBatchBytes` | Optional | `524288` (512 KB) | Max payload size per batch |
-| `metricsExportInterval` | Optional | `60` | Seconds between metric exports. Set to `10` during development for faster feedback |
+| Option | Default | Notes |
+| --- | --- | --- |
+| `endpoint` | required | `https://`; `http://` only with `allowInsecureEndpoint: true` (local development). |
+| `apiKey` | required | The app's `cbr_mob_…` key. Switch at runtime with `updateApiKey(_:)`. |
+| `serviceName` | required | Becomes `service.name`. |
+| `serviceVersion` | `""` | Becomes `service.version`. |
+| `environment` | `production` | Becomes `deployment.environment.name`. |
+| `minSeverity` | `.info` | Log events below it are dropped. |
+| `consentGranted` | `true` | `false` records nothing until `setConsent(true)`. |
+| `autoCapture` | `true` | UIKit screens (view controllers of your app), foreground/background and cold start. |
+| `tracePropagationTargets` | none | Hosts (and subdomains) that get `traceparent` from `rum.data(for:)`. |
+| `exportMetrics` | `false` | Custom metrics are not sent until Ceburu shows mobile metrics. |
+| `queueMaxBytes` / `retentionHours` | 50 MB / 72 h | Log queue limits; lowest severity is evicted first. |
+| `maxBatchEvents` / `maxBatchBytes` | 200 / 256 KB | Per request (the endpoint accepts up to 1 MB). |
+| `metricsExportInterval` | 60 s | |
 
----
+</details>
 
-## Logs
+## 4. Use
 
-The SDK exports log events to `/apm/v1/logs` within ~2 seconds via OTLP/HTTP.
+UIKit screen appearances, foreground/background transitions, cold start and crash capture work with consent.
+Add calls for your own events, SwiftUI screens and network requests. Warm starts, hangs and automatic SwiftUI
+screen names are not implemented. Network requests are captured only when made through `data(for:)` below.
 
-### Step 1 — Connect your existing logger (one-time setup)
-
-Choose the adapter that matches the logger your app already uses:
-
-| Your current logger | Adapter to use |
-|---|---|
-| Custom app logger class / singleton | `CallbackLoggerAdapter` |
-| Apple `os.log` / `Logger` | `OSLogAdapter` |
-| SwiftyBeaver | Write a custom `LoggerAdapter` (see below) |
-| CocoaLumberjack | Write a custom `LoggerAdapter` (see below) |
-| No existing logger | Call `CeburuAnalyticsSDK.shared` directly |
-
----
-
-### Option A — Custom app logger (most common)
-
-If your app already has its own logger class, add one line inside each logging method. No changes needed anywhere else in your app.
+<details>
+<summary>Optional events and API reference</summary>
 
 ```swift
-import CeburuAnalyticsSDK
+let rum = CeburuAnalyticsSDK.shared
+await rum.info("Checkout opened", attributes: ["cart.items": 3])
+await rum.breadcrumb(category: "navigation", message: "Opened payment screen")
+await rum.error("Payment failed", error: error, attributes: ["payment.method": "card"])
 
-// Your existing logger — edit this class once
-class AppLogger {
+await rum.setUser("u-123")        // an opaque id, never an email; "" on logout
+await rum.setConsent(false)       // stops collection, deletes queue, breadcrumbs, user and session
+await rum.trackScreen("Checkout") // SwiftUI screens; UIKit view controllers are captured automatically
+let (data, response) = try await rum.data(for: request)  // URLSession call as a network span; traceparent only on
+                                                        // hops to tracePropagationTargets, checked on every redirect
 
-    static func debug(_ message: String) {
-        print("[DEBUG] \(message)")
-        CallbackLoggerAdapter.shared.forward(level: "DEBUG", message: message)
-    }
-
-    static func info(_ message: String) {
-        print("[INFO] \(message)")
-        CallbackLoggerAdapter.shared.forward(level: "INFO", message: message)
-    }
-
-    static func warn(_ message: String) {
-        print("[WARN] \(message)")
-        CallbackLoggerAdapter.shared.forward(level: "WARN", message: message)
-    }
-
-    static func error(_ message: String, error: Error? = nil) {
-        print("[ERROR] \(message)")
-        CallbackLoggerAdapter.shared.forward(level: "ERROR", message: message, error: error)
-    }
+try await rum.withSpan("checkout.submit", attrs: ["screen": "cart"]) {
+    await rum.info("Order placed")   // carries the span's trace and span id
+    try await placeOrder()
 }
+
+await rum.incrementCounter(name: "checkout.completed")
+await rum.recordHistogram(name: "checkout.duration", value: ms, unit: "ms")
 ```
 
-Register the adapter after SDK initialization:
+Metrics calls are optional and do not export while `exportMetrics` is `false`; keep this default until the
+mobile metrics consumer is available. Trace linking also needs an instrumented backend that accepts trace context.
 
-```swift
-await CeburuAnalyticsSDK.shared.installLoggerAdapter(CallbackLoggerAdapter.shared)
+| API | Notes |
+| --- | --- |
+| `trace/debug/info/warn(_:attributes:)`, `error/fatal(_:error:attributes:)` | Logs; errors carry `exception.*` and breadcrumbs. |
+| `breadcrumb(category:message:)` | Last 50, attached to the next error, fatal or crash. |
+| `withSpan(_:attrs:kind:_:)` / `startSpan(name:attrs:kind:)` | Prefer `withSpan`; it is task-local and concurrency-safe. |
+| `incrementCounter`, `incrementUpDownCounter`, `recordHistogram`, `observeCounter`, `observeGauge` | Keep attribute values few and fixed — no user, session or URL values. |
+| `setUser`, `setConsent`, `newSession`, `updateApiKey` | |
+| `installLoggerAdapter(CallbackLoggerAdapter.shared)` / `OSLogAdapter` | Forward an existing logger. |
+| `flushMetrics()`, `shutdown()` | |
+
+Uncaught `NSException` records are encrypted. Fatal signals use a minimal binary record in the app's private
+storage, not the encrypted log format. Both are imported on the next launch as `rum.crash` events.
+
+</details>
+
+To stop all collection, call `await rum.setConsent(false)`; `autoCapture: false` only disables lifecycle/screen
+capture. Withdrawal clears queued data and identity; it cannot recall requests already sent. The returned
+Boolean reports whether the consent marker was persisted. A failed write triggers immediate cleanup.
+`setUser` while withdrawn only presets identity for the next grant; it does not grant consent.
+
+## 5. What is sent
+
+OTLP/HTTP to `{endpoint}/v1/logs` (JSON), `/v1/traces` and `/v1/metrics` (protobuf) with `Authorization: Bearer <apiKey>`.
+
+- **Resource:** `service.name`, `service.version`, `deployment.environment.name`, `ceburu.signal=rum`,
+  `rum.platform=ios`, `telemetry.distro.name/version`, `app.installation.id` (random per install, reset on reinstall —
+  not the IDFV or IDFA), `device.manufacturer`, `device.model.identifier` (e.g. `iPhone15,2`), `os.name`, `os.version`.
+- **Every log and span:** `session.id` (rotates after 15 min without events or after 4 h), `session.previous_id`,
+  `user.id` after `setUser`. Logs also carry `event.name` (`rum.log`, `rum.error`, `rum.crash`) and the trace context
+  inside `withSpan`.
+- The ingest adds your tenant, the app id and the caller IP (`client.address`); the app never sends a tenant.
+
+**Privacy.** Attribute keys containing `password`, `authorization`, `cookie` or `secret` are dropped; `token`, `card`,
+`email`, `phone` are masked. Messages, stack traces and string values are scanned for emails, bearer tokens, JWTs,
+card numbers and `key=value` secrets, including breadcrumbs and span attributes, events and errors. Without consent
+nothing is recorded or sent (logs, spans, metrics, breadcrumbs, crashes) and the crash handlers are removed;
+withdrawing it also deletes the queue. The privacy manifest declares crash data, performance data, other diagnostic
+data, a user ID (only sent after `setUser`) and a device ID (the installation id), linked to the user because of
+`setUser` and never used for tracking.
+
+Redaction is a safeguard, not a guarantee that arbitrary custom text contains no personal data. Use opaque
+user IDs and avoid private content in events. Complete your app's privacy declaration for its actual use
+of the SDK, including Ceburu as the telemetry recipient.
+
+**Delivery.** The encrypted log queue survives restarts and offline periods (AES-GCM, key in the Keychain;
+without Keychain access it is memory-only and crashes are not saved). Traces and metrics have no durable
+offline queue. The log sender retries network errors, 408, 429 and 5xx with backoff and `Retry-After` support.
+401/403 pause it until key replacement or the next launch; 413 splits batches; 400 drops the rejected batch.
+Device overhead and startup behavior still need measurement; do not assume zero impact.
+
+## 6. Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| `initialize` throws | The error says which option is wrong. |
+| Data stops after a key rotation | The old key expired; ship the new key or call `updateApiKey(_:)`. |
+| Nothing arrives | `consentGranted: false` without `setConsent(true)`, or `minSeverity` above your log level. |
+| Crash frames show addresses only | Expected for stripped release builds until dSYM upload is available. |
+
+## 7. Development and release
+
+```sh
+swift build && swift test                                   # macOS
+xcodebuild -scheme CeburuAnalyticsSDK -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
 
-All existing `AppLogger.warn("...")` calls throughout your app now automatically deliver to the Ceburu Collector — no other changes needed.
-
----
-
-### Option B — Apple os.log / Logger
-
-If your app uses Apple's `Logger` framework, replace your `Logger` instance with `OSLogAdapter`. It logs to both the system console (Xcode / Console.app) and the Ceburu Collector.
-
-```swift
-import CeburuAnalyticsSDK
-
-// Replace this:
-// let log = Logger(subsystem: "com.myapp", category: "payments")
-
-// With this:
-let log = OSLogAdapter(subsystem: "com.myapp", category: "payments")
-
-// Register once at startup:
-await CeburuAnalyticsSDK.shared.installLoggerAdapter(log)
-```
-
-Then use `log` exactly as before — same method names, same call sites:
-
-```swift
-log.info("Payment initiated", attributes: ["amount": "99.00", "currency": "USD"])
-log.warning("Retry attempt 2")
-log.error("Payment declined", attributes: ["code": "ERR_402"])
-```
-
----
-
-### Option C — SwiftyBeaver
-
-Create a custom destination that forwards to the SDK. Write this once in your project:
-
-```swift
-import SwiftyBeaver
-import CeburuAnalyticsSDK
-
-final class CeburuDestination: BaseDestination {
-    override func send(
-        _ level: SwiftyBeaver.Level,
-        msg: String,
-        thread: String,
-        file: String,
-        function: String,
-        line: Int,
-        context: Any? = nil
-    ) -> String? {
-        CallbackLoggerAdapter.shared.forward(level: level.description, message: msg)
-        return super.send(level, msg: msg, thread: thread, file: file,
-                          function: function, line: line, context: context)
-    }
-}
-```
-
-Register at startup:
-
-```swift
-SwiftyBeaver.addDestination(CeburuDestination())
-```
-
-All existing `SwiftyBeaver.warn("...")` calls now also go to the Ceburu Collector.
-
----
-
-### Option D — CocoaLumberjack
-
-Create a custom logger that forwards to the SDK. Write this once in your project:
-
-```swift
-import CocoaLumberjack
-import CeburuAnalyticsSDK
-
-final class CeburuLumberjackLogger: DDAbstractLogger {
-    override func log(message logMessage: DDLogMessage) {
-        let level: String
-        switch logMessage.flag {
-        case .error:   level = "ERROR"
-        case .warning: level = "WARN"
-        case .info:    level = "INFO"
-        case .debug:   level = "DEBUG"
-        default:       level = "TRACE"
-        }
-        CallbackLoggerAdapter.shared.forward(level: level, message: logMessage.message)
-    }
-}
-```
-
-Register at startup:
-
-```swift
-DDLog.add(CeburuLumberjackLogger())
-```
-
----
-
-### Option E — No existing logger
-
-If your app does not use a logging framework, call the SDK directly:
-
-```swift
-await CeburuAnalyticsSDK.shared.debug("User opened payment screen")
-await CeburuAnalyticsSDK.shared.info("Order placed", attributes: ["order_id": "ORD-123"])
-await CeburuAnalyticsSDK.shared.warn("Network slow", attributes: ["latency_ms": 1542])
-await CeburuAnalyticsSDK.shared.error("Checkout failed", attributes: ["code": "ERR_500"])
-```
-
----
-
-### Breadcrumbs
-
-Record UI navigation or user actions. Breadcrumbs are automatically attached to any `error` or `fatal` event that follows, giving you context around failures.
-
-```swift
-await CeburuAnalyticsSDK.shared.breadcrumb(category: "ui", message: "Opened checkout screen")
-await CeburuAnalyticsSDK.shared.breadcrumb(category: "network", message: "Payment API called")
-// If an error fires next, these two breadcrumbs are included automatically
-await CeburuAnalyticsSDK.shared.error("Payment declined")
-```
-
-### Sessions
-
-A session ID is generated automatically at SDK init. Start a new session whenever the user logs in or a new workflow begins:
-
-```swift
-await CeburuAnalyticsSDK.shared.newSession()
-```
-
-### Attributes
-
-Pass key/value metadata with any log call. Values can be `String`, `Int`, `Double`, or `Bool` — non-string values are automatically stringified before export:
-
-```swift
-await CeburuAnalyticsSDK.shared.info(
-    "User action",
-    attributes: [
-        "screen":     "checkout",
-        "action":     "tap_pay",
-        "cart_size":  3,          // Int accepted directly
-        "latency_ms": 1542,
-        "retried":    true        // Bool accepted directly
-    ]
-)
-```
-
-### PII / Secret Handling
-
-The SDK automatically redacts sensitive data in attributes before writing to disk or sending to the collector:
-
-| Key pattern | Behaviour |
-|---|---|
-| Contains `password`, `authorization`, `cookie`, `secret` | Dropped entirely |
-| Contains `token`, `card` | Replaced with `[REDACTED]` |
-| Contains `email`, `phone` | Replaced with SHA-256 hash |
-| Everything else | Sent as-is |
-
-### Offline Behaviour
-
-Events are encrypted with AES-256-GCM and stored on-device when the collector is unreachable. On reconnection the SDK flushes the queue automatically using exponential backoff. Events older than `retentionHours` are discarded. If the queue reaches `queueMaxBytes`, the lowest-severity events are evicted first — FATAL and ERROR events survive storage pressure longer than routine INFO/DEBUG events.
-
-### Crash Reporting
-
-Unhandled exceptions (`NSException`) and POSIX signals (SIGABRT, SIGSEGV, SIGILL, SIGBUS, SIGTRAP) are captured and persisted to disk immediately at crash time using AES-256-GCM encryption. On the next app launch the SDK imports the crash record and delivers it to the collector as a `FATAL` severity event with the full stack trace and breadcrumb trail attached.
-
-The crash event in the collector contains:
-
-| Attribute | Value |
-|---|---|
-| `severity` | `FATAL` |
-| `telemetry.event.type` | `crash` |
-| `exception.type` | Signal name (e.g. `SIGABRT`) or exception class |
-| `exception.message` | Human-readable description |
-| `exception.stacktrace` | Full symbolicated stack trace |
-| `crash.session.id` | Session ID from the crashed run |
-| `session.breadcrumbs` | Pipe-separated breadcrumb trail at crash time |
-
-No additional setup is required — crash handling is enabled automatically on `initialize()`.
-
----
-
-## Log-Trace Correlation
-
-When a log event is emitted while an active OTel span is in context, the SDK automatically captures the span's `trace_id` and `span_id` and attaches them to the log record. When exported, these IDs link the log to its corresponding trace in the backend.
-
-No additional setup is required. To emit a correlated log:
-
-```swift
-let span = await CeburuAnalyticsSDK.shared.startSpan(
-    "checkout.verified",
-    attrs: ["order.id": "ORD-456"]
-)
-
-// This log is emitted while the span is active.
-// trace_id and span_id are captured and attached automatically.
-await CeburuAnalyticsSDK.shared.info("Payment validated", attributes: ["amount": "49.99"])
-
-span.end()
-```
-
-In the collector, the log record will include:
-
-```
-Attributes:
-    -> trace_id: Str(4bf92f3577b34da6a3ce929d0e0e4736)
-    -> span_id:  Str(00f067aa0ba902b7)
-```
-
-Use these to navigate from a log entry directly to its trace in your observability platform.
-
----
-
-## User Identity
-
-Each user is identified through the `userId` config field. It appears as `enduser.id` on every telemetry signal (logs, metrics, traces) emitted during that session.
-
-> **Note:** Multiple users share the same `tenantId`. Each must have a distinct `userId` so their events can be distinguished in the collector.
-
-### Setting userId at Initialization
-
-Pass `userId` in the Config at initialization (see [Initialization](#initialization)).
-
-### Updating userId at Runtime
-
-Call `setUser()` on login, account switch, or logout. The new identity is propagated to both log events and trace spans immediately:
-
-```swift
-await CeburuAnalyticsSDK.shared.setUser("user-john-001")  // after login — logs AND spans carry enduser.id
-await CeburuAnalyticsSDK.shared.setUser("")               // on logout — clears enduser.id
-```
-
-### Output — enduser.id in Resource Attributes
-
-All three signals carry `enduser.id` as a resource attribute alongside `tenant.id`:
-
-```
-Resource attributes:
-     -> tenant.id:     Str(tenant-acme)
-     -> config_id:     Str(cfg-prod-001)
-     -> enduser.id:    Str(user-john-001)
-     -> service.name:  Str(MyApp)
-```
-
----
-
-## Metrics
-
-App-level metrics are exported every `metricsExportInterval` seconds (default: 60) to `/apm/v1/metrics` — a separate endpoint from logs and traces.
-
-### Counter — Monotonically Increasing
-
-```swift
-await CeburuAnalyticsSDK.shared.incrementCounter(
-    "checkout.attempts",
-    value: 1,
-    attrs: ["screen": "cart"]
-)
-```
-
-### UpDownCounter — Bidirectional
-
-```swift
-await CeburuAnalyticsSDK.shared.incrementUpDownCounter("active.downloads", value: +1)
-await CeburuAnalyticsSDK.shared.incrementUpDownCounter("active.downloads", value: -1)
-```
-
-### Histogram — Value Distribution
-
-```swift
-await CeburuAnalyticsSDK.shared.recordHistogram(
-    "api.response.ms",
-    value: 142.0,
-    attrs: ["endpoint": "/checkout"]
-)
-```
-
-### Observable Gauge / Counter — Polled Every `metricsExportInterval` s
-
-Register once at startup; the SDK polls the callback automatically:
-
-```swift
-await CeburuAnalyticsSDK.shared.observeGauge(name: "memory.used.mb", unit: "MiBy") {
-    let info = mach_task_basic_info()
-    // ... return resident memory in MB
-    return memoryMB
-}
-await CeburuAnalyticsSDK.shared.observeCounter(name: "app.sessions.total", unit: "{session}") {
-    Int64(sessionCount)
-}
-```
-
-### Force Flush
-
-Force an immediate metric export outside the normal interval — useful before app backgrounding or in tests:
-
-```swift
-let ok = await CeburuAnalyticsSDK.shared.flushMetrics()
-// ok == true  → metrics delivered to collector
-// ok == false → collector unreachable (check host / port)
-```
-
-### Expected Collector Output
-
-```
-ResourceMetrics #0
-Resource attributes:
-     -> tenant.id: Str(tenant-acme)    -> enduser.id: Str(user-john-001)
-Metric #0  Name: checkout.attempts  DataType: Sum  IsMonotonic: true  Value: 3
-Metric #1  Name: active.downloads   DataType: Sum  IsMonotonic: false  Value: 2
-Metric #2  Name: api.response.ms    DataType: Histogram  Count: 5  Sum: 612.0
-Metric #3  Name: memory.used.mb     DataType: Gauge  Value: 271.0
-Metric #4  Name: app.sessions.total DataType: Sum  IsMonotonic: true  Value: 1
-```
-
-### SDK-Internal Health Metrics
-
-The SDK automatically reports its own health counters alongside your app metrics. These require no setup and are visible in the same collector output:
-
-| Metric | Attributes | Meaning |
-|---|---|---|
-| `mobile.sdk.events.emitted` | `severity`, `event.type` | Events successfully queued to on-device storage |
-| `mobile.sdk.events.dropped` | _(none)_ | Events rejected by policy, severity filter, or sample rate |
-| `mobile.sdk.export.success` | `events` (batch count) | Batches successfully delivered to the log processor |
-| `mobile.sdk.export.failure` | _(none)_ | Delivery failures — events remain in queue for retry |
-
-Use `mobile.sdk.events.dropped` and `mobile.sdk.export.failure` to alert on SDK health in production without any app-side instrumentation.
-
----
-
-## Distributed Tracing
-
-Traces are exported to `/apm/v1/traces` within seconds of `span.end()` — independently of logs and metrics.
-
-### Start and End a Span
-
-```swift
-let span = await CeburuAnalyticsSDK.shared.startSpan(
-    "payment.flow",
-    attrs: ["cart.id": "cart-123"]
-)
-span.setAttribute(key: "order.id", value: "ORD-456")
-span.setAttribute(key: "amount.usd", value: "99.99")
-span.end()
-
-// On failure:
-span.endWithError(PaymentError.declined)   // records status=ERROR + exception stack trace
-```
-
-### SpanKind
-
-```swift
-// CLIENT — outgoing network call
-let span = await CeburuAnalyticsSDK.shared.startSpan(
-    "outgoing.http.call",
-    attrs: ["http.method": "GET", "http.url": "https://api.example.com"],
-    kind: .client
-)
-```
-
-### Span Events
-
-```swift
-span.addEvent(name: "cart.validated")
-span.addEvent(name: "payment.initiated", attrs: ["gateway": "stripe", "amount": "99.99"])
-span.addEvent(name: "payment.confirmed", attrs: ["transaction.id": "txn_001"])
-```
-
-### Expected Collector Output
-
-```
-ResourceSpans #0
-Resource attributes:
-     -> tenant.id: Str(tenant-acme)    -> enduser.id: Str(user-john-001)
-Span #0
-    Name: payment.flow    Kind: Internal    Status: Unset
-    Attributes:
-         -> cart.id:    Str(cart-123)
-         -> order.id:   Str(ORD-456)
-         -> amount.usd: Str(99.99)
-```
-
----
-
-## Authentication & Token Rotation
-
-Every export request carries a Bearer token in the `Authorization` HTTP header. The token is customer-provided — never hardcode it; load from a secure remote config at startup.
-
-### Setting the Token
-
-Pass `authToken` in the Config at initialization (see [Initialization](#initialization)).
-
-### Token Rotation
-
-Call `updateAuthToken()` to swap the token at runtime. It takes effect on the very next export batch — all three pipelines (logs, metrics, traces) are rebuilt immediately with the new token:
-
-```swift
-try? await CeburuAnalyticsSDK.shared.updateAuthToken("new-token-xyz")
-```
-
----
-
-## Telemetry Signal Endpoints — Three Separate API Calls
-
-One SDK action can produce up to three separate HTTP POST requests, each to its own endpoint:
-
-| Signal | Endpoint | Timing |
-|---|---|---|
-| Logs | `POST /apm/v1/logs` | Within ~2 s |
-| Metrics | `POST /apm/v1/metrics` | Every `metricsExportInterval` s (default 60) |
-| Traces | `POST /apm/v1/traces` | Within ~5 s of `span.end()` |
-
-All three carry the same `tenant.id`, `config_id`, and `enduser.id` resource attributes, enabling cross-signal correlation in the backend.
-
----
-
-## Security Notes
-
-- The on-device event queue is encrypted with AES-256-GCM using a key stored in the iOS Keychain
-- The Keychain key is protected with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`
-- Crash records are encrypted with AES-256-GCM at crash time using a key derived from the app bundle ID
-- All endpoints must use HTTPS in production — `useHTTPS: false` is for local development only
-- Do not embed `collectorHost`, `tenantId`, `applicationId`, or `configId` as hardcoded strings in production — load them from your remote config or backend at runtime
-
----
-
-## Local Testing
-
-For local development with a Docker collector, point the SDK at your Mac's loopback address from the simulator:
-
-```swift
-try? await CeburuAnalyticsSDK.shared.initialize(
-    config: CeburuAnalyticsSDK.Config(
-        // ...
-        collectorHost: "localhost",  // simulator reaches the Mac on localhost
-        collectorPort: 4318,         // standard OTLP/HTTP port
-        useHTTPS:      false,        // dev only — must be true in production
-        // ...
-    )
-)
-```
-
-> **Note:** The iOS Simulator shares the Mac's network stack, so `localhost` resolves to the Mac. On a physical device, use your Mac's LAN IP address instead (e.g. `192.168.1.10`).
-
-Add to your app's `Info.plist` to allow plain-text local traffic:
-
-```xml
-<key>NSAppTransportSecurity</key>
-<dict>
-    <key>NSAllowsLocalNetworking</key>
-    <true/>
-</dict>
-```
-
-Or use `network_security_config.xml` equivalent (see Apple's ATS documentation for domain-level exceptions).
+CI runs `swift build`, `swift test` and an iOS simulator build on macOS for pull requests and main.
+After CI and device smoke tests pass, set `sdkVersion` in `CeburuAnalyticsSDK.swift`, update
+[CHANGELOG](CHANGELOG.md), and push the matching plain tag `X.Y.Z` (no `v` for this repository).
+The release workflow repeats CI, verifies the tag and creates a GitHub source release. Customers use the
+repository URL and version in Swift Package Manager; no Maven, App Store upload or Apple signing key is needed.
+
+The workflow uses GitHub's automatic `GITHUB_TOKEN` with release write permission; no publishing secret is
+needed. A pushed tag is already visible to Swift Package Manager even if release CI fails, so wait for green
+main CI before tagging. Do not move a version tag after customers have used it.
+
+Licensed under the [Apache License 2.0](LICENSE).
