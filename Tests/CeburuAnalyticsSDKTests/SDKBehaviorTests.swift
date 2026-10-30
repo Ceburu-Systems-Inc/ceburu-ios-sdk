@@ -1,4 +1,5 @@
 import XCTest
+import OpenTelemetrySdk
 @testable import CeburuAnalyticsSDK
 
 /// Tests for behavioral correctness of the SDK actor, covering fixes from the
@@ -199,6 +200,36 @@ final class SDKBehaviorTests: XCTestCase {
         XCTAssertFalse(gate.allows("held"))
         XCTAssertTrue(gate.allows("new"))
         XCTAssertFalse(gate.allows("new"))  // each span is released once
+    }
+
+    func testConcurrentMetricExportsDropOneBatchAfterWithdrawal() {
+        let gate = ConsentGate(true, metricsEnabled: true)
+        let sink = MetricSink()
+        let exporter = GatedMetricExporter(sink, gate)
+        _ = gate.revoke()
+        gate.isGranted = true
+        DispatchQueue.concurrentPerform(iterations: 100) { _ in
+            _ = exporter.export(metrics: [])
+        }
+        XCTAssertEqual(sink.count, 99)
+        _ = gate.revoke()
+        _ = exporter.export(metrics: [])
+        _ = exporter.export(metrics: [])
+        XCTAssertEqual(sink.count, 99)
+    }
+
+    private final class MetricSink: MetricExporter, @unchecked Sendable {
+        private let lock = NSLock()
+        private var calls = 0
+        var count: Int { lock.lock(); defer { lock.unlock() }; return calls }
+        func export(metrics: [MetricData]) -> ExportResult {
+            lock.lock(); defer { lock.unlock() }
+            calls += 1
+            return .success
+        }
+        func flush() -> ExportResult { .success }
+        func shutdown() -> ExportResult { .success }
+        func getAggregationTemporality(for instrument: InstrumentType) -> AggregationTemporality { .delta }
     }
 
     func testTraceContextGoesOnlyToConfiguredHosts() {

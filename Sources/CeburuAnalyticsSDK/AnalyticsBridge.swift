@@ -540,16 +540,23 @@ final class GatedSpanExporter: SpanExporter {
 /// Off unless `Config.exportMetrics`; drops exports (reporting success) while consent is withdrawn. The first
 /// export after a withdrawal is dropped too: it can hold values recorded before it. Delta temporality, so
 /// nothing recorded earlier carries over into later exports.
-final class GatedMetricExporter: MetricExporter {
+final class GatedMetricExporter: MetricExporter, @unchecked Sendable {
     private let inner: MetricExporter
     private let gate: ConsentGate
+    private let lock = NSLock()
     private var exportedGeneration: Int
     init(_ inner: MetricExporter, _ gate: ConsentGate) { self.inner = inner; self.gate = gate; exportedGeneration = gate.generation }
 
     func export(metrics: [MetricData]) -> ExportResult {
+        guard allowsExport() else { return .success }
+        return inner.export(metrics: metrics)
+    }
+
+    private func allowsExport() -> Bool {
+        lock.lock(); defer { lock.unlock() }
         let generation = gate.generation
-        if generation != exportedGeneration { exportedGeneration = generation; return .success }
-        return gate.metricsEnabled && gate.isGranted ? inner.export(metrics: metrics) : .success
+        if generation != exportedGeneration { exportedGeneration = generation; return false }
+        return gate.metricsEnabled && gate.isGranted
     }
     func flush() -> ExportResult { inner.flush() }
     func shutdown() -> ExportResult { inner.shutdown() }
