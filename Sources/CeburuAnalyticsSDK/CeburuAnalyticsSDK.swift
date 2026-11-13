@@ -217,11 +217,22 @@ public actor CeburuAnalyticsSDK {
             return self
         }
 
+        /// Body sizes and protocol of a finished request.
+        func setNetworkAttributes(_ metrics: NetworkMetrics?) {
+            guard let span, let metrics else { return }
+            for (key, value) in metrics.attributes { span.setAttribute(key: key, value: value) }
+        }
+
         /// Ends a network span with its HTTP status (4xx/5xx mark it failed).
         func end(status: Int) {
             span?.setAttribute(key: "http.response.status_code", value: AttributeValue.int(status))
             if status >= 400 { span?.status = Status.error(description: "HTTP \(status)") }
             span?.end()
+        }
+
+        /// Ends the span at a time already measured, for events recorded after they happened.
+        func end(at time: Date) {
+            span?.end(time: time)
         }
 
         /// Marks the span successful and ends it. Call exactly once.
@@ -324,6 +335,11 @@ public actor CeburuAnalyticsSDK {
             throw NSError(domain: "CeburuAnalyticsSDK", code: -3, userInfo: [NSLocalizedDescriptionKey: "apiKey is required"])
         }
 
+        // Setup below can outlast the first screen, so watch for it now and record it once running.
+        #if canImport(UIKit)
+        if config.autoCapture { await MainActor.run { AutoCapture.prepare() } }
+        #endif
+
         // Resolve device info before creating the bridge — AnalyticsBridge.init is
         // synchronous so it cannot call UIDevice itself. These values go into the
         // OTel Resource so every span and metric (not just the init log event) carries
@@ -418,6 +434,10 @@ public actor CeburuAnalyticsSDK {
         if config.autoCapture {
             #if canImport(UIKit)
             await MainActor.run { AutoCapture.install() }
+            #endif
+        } else {
+            #if canImport(UIKit)
+            await MainActor.run { AutoCapture.discardPending() }
             #endif
         }
 
@@ -572,16 +592,18 @@ public actor CeburuAnalyticsSDK {
         await recordScreen(name, start: Date())
     }
 
-    func recordScreen(_ name: String, start: Date) async {
+    func recordScreen(_ name: String, start: Date, end: Date? = nil) async {
         guard running, consent else { return }
         viewId = String(Self.newId().prefix(16))
         viewName = String(Security.redactText(String(name.prefix(256))).prefix(128))
-        await internalSpan("screen_view", [:], start: start)?.end()
+        let span = await internalSpan("screen_view", [:], start: start)
+        if let end { span?.end(at: end) } else { span?.end() }
     }
 
-    func recordColdStart(_ start: Date) async {
+    func recordColdStart(_ start: Date, end: Date? = nil) async {
         guard running, consent else { return }
-        await internalSpan("app_start", ["app.start.type": "cold"], start: start)?.end()
+        let span = await internalSpan("app_start", ["app.start.type": "cold"], start: start)
+        if let end { span?.end(at: end) } else { span?.end() }
     }
 
     func recordAppState(foreground: Bool) async {
@@ -621,45 +643,74 @@ public actor CeburuAnalyticsSDK {
         guard let span = await internalSpan(method, attrs, kind: .client) else { return nil }
         let header = span.spanContext.flatMap { ctx in
             Self.propagates(host: host, targets: config.tracePropagationTargets) && (url.scheme == "https" || url.scheme == "http")
-                ? "00-\(ctx.traceId)-\(ctx.spanId)-01" : nil
+                ? Self.traceparent(traceId: ctx.traceId, spanId: ctx.spanId) : nil
         }
         return (span, header, config.tracePropagationTargets)
     }
 
-    /// `URLSession.data(for:)` recorded as a CLIENT span: method, URL without query or fragment, status and
-    /// duration. Adds `traceparent` only for hosts in ``Config/tracePropagationTargets``. No bodies, headers
-    /// or cookies are read. Redirects followed by URLSession are part of the same span.
+    /// W3C trace context header, sampled: `00-<32 hex trace id>-<16 hex span id>-01`.
+    static func traceparent(traceId: String, spanId: String) -> String {
+        "00-\(traceId)-\(spanId)-01"
+    }
+
+    /// `URLSession.data(for:)` recorded as a CLIENT span: method, URL without query or fragment, status, duration,
+    /// and body sizes and protocol from `URLSessionTaskMetrics`. Adds `traceparent` only for hosts in
+    /// ``Config/tracePropagationTargets``. No bodies, headers or cookies are read.
+    /// Redirects followed by URLSession are part of the same span.
     public nonisolated func data(for request: URLRequest, session: URLSession = .shared) async throws -> (Data, URLResponse) {
         guard let started = await startNetworkSpan(request) else { return try await session.data(for: request) }
-        let (span, header) = (started.span, started.header)
-        var outgoing = request
-        var redirects: RedirectGuard?
-        if let header, request.value(forHTTPHeaderField: "traceparent") == nil {
-            outgoing.setValue(header, forHTTPHeaderField: "traceparent")
-            redirects = RedirectGuard(targets: started.targets, https: request.url?.scheme == "https")
-        }
+        let span = started.span
+        let outgoing = Self.withTraceparent(request, header: started.header)
+        // The delegate always collects metrics; it guards redirects only when the SDK added the header.
+        let injected = outgoing.value(forHTTPHeaderField: "traceparent") != request.value(forHTTPHeaderField: "traceparent")
+        let delegate = NetworkTaskDelegate(targets: injected ? started.targets : nil, https: request.url?.scheme == "https")
         do {
-            let (data, response) = try await session.data(for: outgoing, delegate: redirects)
+            let (data, response) = try await session.data(for: outgoing, delegate: delegate)
+            span.setNetworkAttributes(delegate.metrics)
             span.end(status: (response as? HTTPURLResponse)?.statusCode ?? 0)
             return (data, response)
         } catch {
+            span.setNetworkAttributes(delegate.metrics)
             span.endWithError(error)
             throw error
         }
     }
 
-    /// Keeps the SDK's `traceparent` only on redirect hops to allowed hosts (never an https → http downgrade).
-    /// It is the task delegate of `data(for:)`, so the app's session delegate is not asked about these redirects.
-    final class RedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-        let targets: [String]
+    /// Adds the SDK's `traceparent` unless there is none to add or the app already set one.
+    static func withTraceparent(_ request: URLRequest, header: String?) -> URLRequest {
+        guard let header, request.value(forHTTPHeaderField: "traceparent") == nil else { return request }
+        var outgoing = request
+        outgoing.setValue(header, forHTTPHeaderField: "traceparent")
+        return outgoing
+    }
+
+    /// Task delegate of `data(for:)`: keeps `URLSessionTaskMetrics` for the span and, when the SDK added
+    /// `traceparent`, keeps it only on redirect hops to allowed hosts (never an https → http downgrade).
+    /// The app's session delegate is not asked about these redirects.
+    final class NetworkTaskDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        let targets: [String]?
         let https: Bool
-        init(targets: [String], https: Bool) { self.targets = targets; self.https = https }
+        private let lock = NSLock()
+        private var collected: NetworkMetrics?
+        init(targets: [String]?, https: Bool) { self.targets = targets; self.https = https }
+
+        var metrics: NetworkMetrics? { lock.lock(); defer { lock.unlock() }; return collected }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+            guard let last = metrics.transactionMetrics.last else { return }
+            let value = NetworkMetrics(last)
+            lock.lock(); collected = value; lock.unlock()
+        }
 
         func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                         newRequest request: URLRequest) async -> URLRequest? {
-            Self.next(request, targets: targets, https: https)
+            guard let targets else { return request }
+            return RedirectGuard.next(request, targets: targets, https: https)
         }
+    }
 
+    /// Redirect rule for the SDK's `traceparent`.
+    enum RedirectGuard {
         static func next(_ request: URLRequest, targets: [String], https: Bool) -> URLRequest {
             var next = request
             let host = request.url?.host ?? ""

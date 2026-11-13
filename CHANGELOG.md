@@ -4,6 +4,19 @@ All notable changes to the Ceburu RUM SDK for iOS (`ceburu-ios-sdk`, Swift packa
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 The wire contract (attribute names) is part of the public API.
 
+## [Unreleased]
+
+### Fixed
+- `app_start` is measured to the real first screen. Screens were only watched after `initialize` finished, so a slow
+  setup measured to a later screen, or lost the launch. Watching now starts at the top of `initialize`, and the first
+  screens are held and recorded once the SDK is running, under the same consent checks.
+
+### Added
+- `CeburuAnalyticsSDK.prepareAutoCapture()`: optional synchronous start of screen watching for apps that call
+  `initialize` from a `Task`.
+- Network spans from `data(for:session:)` carry `http.request.body.size`, `http.response.body.size` and
+  `network.protocol.name` / `network.protocol.version` (for example `http` / `2`) from `URLSessionTaskMetrics`.
+
 ## [1.0.0-beta.1] - 2026-10-30
 
 ### Fixed

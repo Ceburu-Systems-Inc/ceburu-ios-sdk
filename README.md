@@ -81,7 +81,7 @@ catch them without interrupting your app. Supply `serviceVersion` to compare you
 | `environment` | `production` | Becomes `deployment.environment.name`. |
 | `minSeverity` | `.info` | Log events below it are dropped. |
 | `consentGranted` | `true` | `false` records nothing until `setConsent(true)`. |
-| `autoCapture` | `true` | UIKit screens (view controllers of your app), foreground/background and cold start. |
+| `autoCapture` | `true` | UIKit screens (view controllers of your app), foreground/background and cold start. Call `CeburuAnalyticsSDK.prepareAutoCapture()` first in `didFinishLaunching` if you start the SDK from a `Task`. |
 | `tracePropagationTargets` | none | Hosts (and subdomains) that get `traceparent` from `rum.data(for:)`. |
 | `exportMetrics` | `false` | Custom metrics are not sent until Ceburu shows mobile metrics. |
 | `queueMaxBytes` / `retentionHours` | 50 MB / 72 h | Log queue limits; lowest severity is evicted first. |
