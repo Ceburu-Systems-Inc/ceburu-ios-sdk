@@ -287,6 +287,8 @@ public actor CeburuAnalyticsSDK {
     private var viewId     = ""
     private var viewName   = ""
     private var appState   = "foreground"
+    /// `host` or `host:port` of the ingest endpoint; requests to it are the SDK's own and are not recorded.
+    private var endpointHost = ""
     // Consent generation shared with the exporters and the queue; replaced on every initialize.
     private var gate       = ConsentGate(true)
     private var backoff    = RetryBackoff()
@@ -336,8 +338,9 @@ public actor CeburuAnalyticsSDK {
         }
 
         // Setup below can outlast the first screen, so watch for it now and record it once running.
+        // Not awaited: during launch the main thread can be busy for seconds, and initialize must not wait for it.
         #if canImport(UIKit)
-        if config.autoCapture { await MainActor.run { AutoCapture.prepare() } }
+        if config.autoCapture { Task { @MainActor in AutoCapture.prepare() } }
         #endif
 
         // Resolve device info before creating the bridge — AnalyticsBridge.init is
@@ -354,7 +357,9 @@ public actor CeburuAnalyticsSDK {
         var machineBuf = [CChar](repeating: 0, count: machineSize)
         sysctlbyname("hw.machine", &machineBuf, &machineSize, nil, 0)
         let deviceModel = String(cString: machineBuf)
-        let osVersion   = await UIDevice.current.systemVersion
+        // ProcessInfo instead of UIDevice, which would wait for the main thread.
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        let osVersion   = v.patchVersion > 0 ? "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)" : "\(v.majorVersion).\(v.minorVersion)"
         let osName      = "iOS"
         #else
         let deviceModel = "Mac"
@@ -391,6 +396,7 @@ public actor CeburuAnalyticsSDK {
         self.authorization.update()
         self.batchEvents = max(1, config.maxBatchEvents)
         self.running = true
+        if let port = url.port { self.endpointHost = "\(host.lowercased()):\(port)" } else { self.endpointHost = host.lowercased() }
 
         // An unexpired session from the previous launch continues.
         if let saved = await storage.loadSession(), !Self.expired(start: saved.start, last: saved.lastActivity, now: Date()) {
@@ -431,15 +437,14 @@ public actor CeburuAnalyticsSDK {
             }
         }
 
+        // Not awaited, for the same reason as prepare() above; what appears meanwhile is held and recorded.
+        #if canImport(UIKit)
         if config.autoCapture {
-            #if canImport(UIKit)
-            await MainActor.run { AutoCapture.install() }
-            #endif
+            Task { @MainActor in AutoCapture.install() }
         } else {
-            #if canImport(UIKit)
-            await MainActor.run { AutoCapture.discardPending() }
-            #endif
+            Task { @MainActor in AutoCapture.discardPending() }
         }
+        #endif
 
         if await storage.keychainFailed {
             await warn(
@@ -531,7 +536,8 @@ public actor CeburuAnalyticsSDK {
         rotateSession()
     }
 
-    /// The current session id; rotates after 15 min without events or 4 h in total (as the web SDK).
+    /// The current session id; rotates after 15 min without events or 4 h in total (as the web and Android SDKs).
+    /// Every event counts as activity, in the foreground or background; `rum.app.state` tells them apart.
     private func currentSession() -> String {
         let now = Date()
         if Self.expired(start: sessionStart, last: lastActivity, now: now) { return rotateSession() }
@@ -572,6 +578,13 @@ public actor CeburuAnalyticsSDK {
         return sessionId
     }
 
+    /// The session to link a post-crash launch to: the resumed session when it is the one that crashed,
+    /// otherwise the most recent crashed session. nil when there was no crash.
+    static func sessionThatCrashed(_ crashed: [String], current: String) -> String? {
+        if crashed.contains(current) { return current }
+        return crashed.last
+    }
+
     static func newId() -> String {
         UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
@@ -596,18 +609,21 @@ public actor CeburuAnalyticsSDK {
         guard running, consent else { return }
         viewId = String(Self.newId().prefix(16))
         viewName = String(Security.redactText(String(name.prefix(256))).prefix(128))
+        breadcrumb(category: "screen", message: viewName)
         let span = await internalSpan("screen_view", [:], start: start)
         if let end { span?.end(at: end) } else { span?.end() }
     }
 
-    func recordColdStart(_ start: Date, end: Date? = nil) async {
+    /// `type` is `cold`, `warm` or `hot`.
+    func recordAppStart(_ start: Date, end: Date? = nil, type: String = "cold") async {
         guard running, consent else { return }
-        let span = await internalSpan("app_start", ["app.start.type": "cold"], start: start)
+        let span = await internalSpan("app_start", ["app.start.type": type], start: start)
         if let end { span?.end(at: end) } else { span?.end() }
     }
 
     func recordAppState(foreground: Bool) async {
         appState = foreground ? "foreground" : "background"
+        breadcrumb(category: "app", message: appState)
         guard running, consent else { return }
         await internalSpan("app_state", [:])?.end()
         // The app may be suspended or killed in the background: send what is buffered now.
@@ -635,6 +651,9 @@ public actor CeburuAnalyticsSDK {
 
     private func startNetworkSpan(_ request: URLRequest) async -> (span: AppSpan, header: String?, targets: [String])? {
         guard running, consent, let config, let url = request.url, let host = url.host else { return nil }
+        // The SDK's own exports are not app traffic.
+        let target = url.port.map { "\(host.lowercased()):\($0)" } ?? host.lowercased()
+        if !endpointHost.isEmpty && target == endpointHost { return nil }
         var parts = URLComponents(url: url, resolvingAgainstBaseURL: false)
         parts?.query = nil; parts?.fragment = nil; parts?.user = nil; parts?.password = nil
         let method = String((request.httpMethod ?? "GET").uppercased().prefix(16))
@@ -667,13 +686,22 @@ public actor CeburuAnalyticsSDK {
         do {
             let (data, response) = try await session.data(for: outgoing, delegate: delegate)
             span.setNetworkAttributes(delegate.metrics)
-            span.end(status: (response as? HTTPURLResponse)?.statusCode ?? 0)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            span.end(status: status)
+            await networkBreadcrumb(request, outcome: "\(status)")
             return (data, response)
         } catch {
             span.setNetworkAttributes(delegate.metrics)
             span.endWithError(error)
+            await networkBreadcrumb(request, outcome: "failed")
             throw error
         }
+    }
+
+    /// `GET host/path → 503`: method, host and path only, no query.
+    private func networkBreadcrumb(_ request: URLRequest, outcome: String) {
+        guard let url = request.url else { return }
+        breadcrumb(category: "network", message: "\(request.httpMethod ?? "GET") \(url.host ?? "")\(url.path) → \(outcome)")
     }
 
     /// Adds the SDK's `traceparent` unless there is none to add or the app already set one.
@@ -807,7 +835,7 @@ public actor CeburuAnalyticsSDK {
         // I6: capture call stack HERE — nonisolated, so we're still on the caller's executor
         // before the actor hop. Pre-stringify to [String: String] (Sendable) before crossing.
         let stack = error != nil ? Thread.callStackSymbols : []
-        let sendable = Self.stringify(Self.mergeError(attributes, error, stack: stack))
+        let sendable = Self.stringify(Self.mergeError(attributes, error, message: message, stack: stack))
         await emitSendable(.error, message, sendable)
     }
 
@@ -822,7 +850,7 @@ public actor CeburuAnalyticsSDK {
     public nonisolated func fatal(_ message: String, error: Error? = nil, attributes: [String: Any] = [:]) async {
         // I6: same pattern as error() — stack captured before actor hop.
         let stack = error != nil ? Thread.callStackSymbols : []
-        let sendable = Self.stringify(Self.mergeError(attributes, error, stack: stack))
+        let sendable = Self.stringify(Self.mergeError(attributes, error, message: message, stack: stack))
         await emitSendable(.fatal, message, sendable)
     }
 
@@ -1059,6 +1087,14 @@ public actor CeburuAnalyticsSDK {
         return await bridge?.flushMetrics() ?? false
     }
 
+    /// Sends everything buffered now: ended spans, metrics and queued logs. Spans live in memory until
+    /// exported, so call this before an intentional exit (or a test crash) to keep them.
+    public func flush() async {
+        await bridge?.flushSpans()
+        _ = await bridge?.flushMetrics()
+        _ = await flushPersisted()
+    }
+
     public func shutdown() async {
         #if canImport(UIKit)
         await MainActor.run { AutoCapture.uninstall() }
@@ -1195,10 +1231,16 @@ public actor CeburuAnalyticsSDK {
     private func startCrashCapture() async {
         guard let storage else { return }
         let generation = gate.generation
-        try? await storage.importCrashRecords(sessionId: sessionId, generation: generation)
-        try? await storage.importSignalCrashRecords(sessionId: sessionId, generation: generation)
+        let crashed = ((try? await storage.importCrashRecords(sessionId: sessionId, generation: generation)) ?? [])
+            + ((try? await storage.importSignalCrashRecords(sessionId: sessionId, generation: generation)) ?? [])
         // Actor reentrancy: a withdrawal or shutdown may have run during the imports; then the handlers stay off.
         guard running, consent, gate.generation == generation, self.storage === storage else { return }
+        // The previous run crashed: its crash stays in its own session, and this launch starts a new one linked to it.
+        if let crashedSession = Self.sessionThatCrashed(crashed, current: sessionId) {
+            rotateSession()
+            previousSessionId = crashedSession
+            saveSession()
+        }
         installExceptionHandler()
         SignalCrashHandler.install(crashDir: storage.crashDir, sessionId: sessionId)
     }
@@ -1240,8 +1282,14 @@ public actor CeburuAnalyticsSDK {
         await emit(severity, message, attrs as [String: Any])
     }
 
-    private static func mergeError(_ attrs: [String: Any], _ error: Error?, stack: [String] = []) -> [String: Any] {
-        guard let error else { return attrs }
+    private static func mergeError(_ attrs: [String: Any], _ error: Error?, message: String, stack: [String] = []) -> [String: Any] {
+        guard let error else {
+            // A plain error log still needs a type and message, or it shows up as an issue with no title.
+            var out = attrs
+            if out["exception.type"] == nil { out["exception.type"] = "LoggedError" }
+            if out["exception.message"] == nil { out["exception.message"] = String(message.prefix(1024)) }
+            return out
+        }
         var out = attrs
         out["exception.type"]    = String(describing: type(of: error))
         out["exception.message"] = String(error.localizedDescription.prefix(1024))

@@ -128,6 +128,14 @@ final class SDKBehaviorTests: XCTestCase {
 
     // MARK: - Sessions and responses
 
+    /// After a crash the next launch starts a new session linked to the one that crashed, even when it is unexpired.
+    func testSessionAfterCrash() {
+        XCTAssertNil(CeburuAnalyticsSDK.sessionThatCrashed([], current: "resumed"))           // no crash: keep resuming
+        XCTAssertEqual(CeburuAnalyticsSDK.sessionThatCrashed(["resumed"], current: "resumed"), "resumed")
+        XCTAssertEqual(CeburuAnalyticsSDK.sessionThatCrashed(["old", "resumed"], current: "resumed"), "resumed")
+        XCTAssertEqual(CeburuAnalyticsSDK.sessionThatCrashed(["a", "b"], current: "fresh"), "b") // expired: latest crash
+    }
+
     func testSessionExpiry() {
         let now = Date()
         XCTAssertFalse(CeburuAnalyticsSDK.expired(start: now.addingTimeInterval(-3600), last: now.addingTimeInterval(-60), now: now))

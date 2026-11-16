@@ -498,7 +498,10 @@ actor EncryptedStore {
     /// for the next launch.
     ///
     /// Each crash keeps the session it happened in; `sessionId` is only the fallback for old files.
-    func importCrashRecords(sessionId: String, generation: Int) async throws {
+    /// - Returns: the session ids of the crashes imported, oldest first.
+    @discardableResult
+    func importCrashRecords(sessionId: String, generation: Int) async throws -> [String] {
+        var crashed: [(at: Int64, session: String)] = []
         let files = (try? FileManager.default.contentsOfDirectory(
             at: crashDir, includingPropertiesForKeys: nil
         )) ?? []
@@ -535,10 +538,12 @@ actor EncryptedStore {
 
                 try enqueue(event, generation: generation)
                 try? FileManager.default.removeItem(at: file)
+                crashed.append((event.timestampUnixMs, crashSessionId))
             } catch {
                 // Keep for a later launch.
             }
         }
+        return crashed.sorted { $0.at < $1.at }.map(\.session)
     }
 
     private func queueFiles() -> [URL] {
@@ -604,7 +609,10 @@ actor EncryptedStore {
     /// Files that cannot be parsed are deleted immediately to avoid repeated failed imports.
     ///
     /// - Parameter sessionId: The current session ID — used as the delivery session for imported crashes.
-    func importSignalCrashRecords(sessionId: String, generation: Int) async throws {
+    /// - Returns: the session ids of the crashes imported, oldest first.
+    @discardableResult
+    func importSignalCrashRecords(sessionId: String, generation: Int) async throws -> [String] {
+        var crashed: [(at: Int64, session: String)] = []
         let breadcrumbsFile = crashDir.appendingPathComponent("breadcrumbs.enc")
         let stale = recordedBeforeRevocation(breadcrumbsFile)
         let savedBreadcrumbs: String = {
@@ -643,6 +651,7 @@ actor EncryptedStore {
                 try enqueue(event, generation: generation)
                 try? FileManager.default.removeItem(at: file)
                 importedAny = true
+                crashed.append((event.timestampUnixMs, event.sessionId))
             } catch {
                 // Keep for a later launch
             }
@@ -651,6 +660,7 @@ actor EncryptedStore {
         if importedAny {
             try? FileManager.default.removeItem(at: breadcrumbsFile)  // breadcrumbs.enc
         }
+        return crashed.sorted { $0.at < $1.at }.map(\.session)
     }
 
     /// Parses the binary `.sigseg` crash file written by ``SignalCrashHandler``.
