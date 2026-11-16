@@ -6,6 +6,8 @@ The wire contract (attribute names) is part of the public API.
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-11-16
+
 ### Fixed
 - `app_start` is measured to the real first screen. Screens were only watched after `initialize` finished, so a slow
   setup measured to a later screen, or lost the launch. Watching now starts at the top of `initialize`, and the first

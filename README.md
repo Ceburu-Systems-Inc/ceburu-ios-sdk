@@ -25,14 +25,14 @@ distribute the replacement through an app update or your own configuration servi
 
 ## 2. Install
 
-**Beta for evaluation: 1.0.0-beta.1.** Pin the beta explicitly after its Git tag is published.
+**Current release: 4.0.0.** Available once its Git tag is published.
 Device delivery and overhead validation remain open; this is not a production-certified release.
 
 Xcode: **File → Add Package Dependencies…** → `https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk`,
-**Exact Version** `1.0.0-beta.1`, product `CeburuAnalyticsSDK`. Or in `Package.swift`:
+**Exact Version** `4.0.0`, product `CeburuAnalyticsSDK`. Or in `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk.git", exact: "1.0.0-beta.1")
+.package(url: "https://github.com/Ceburu-Systems-Inc/ceburu-ios-sdk.git", exact: "4.0.0")
 // target dependency:
 .product(name: "CeburuAnalyticsSDK", package: "ceburu-ios-sdk")
 ```

@@ -21,7 +21,7 @@ public actor CeburuAnalyticsSDK {
 
     // Sent as telemetry.distro.name/version; keep sdkVersion equal to the release tag.
     static let sdkName    = "ceburu-ios-sdk"
-    static let sdkVersion = "1.0.0-beta.1"
+    static let sdkVersion = "4.0.0"
 
     // ── Severity ───────────────────────────────────────────────────────────────
 
